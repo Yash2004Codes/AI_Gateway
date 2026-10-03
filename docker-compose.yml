@@ -1,0 +1,117 @@
+services:
+  # ─────────────────────────────────────────────
+  # Infrastructure Services
+  # ─────────────────────────────────────────────
+  redis:
+    image: redis:7.2-alpine
+    container_name: ai_gateway_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - gateway_net
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: ai_gateway_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-gateway}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gateway_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-ai_gateway}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./packages/server/src/db/migrations/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gateway}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - gateway_net
+
+  # ─────────────────────────────────────────────
+  # Application Services
+  # ─────────────────────────────────────────────
+  api-server:
+    build:
+      context: ./packages/server
+      dockerfile: Dockerfile
+      target: production
+    container_name: ai_gateway_api
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgresql://${POSTGRES_USER:-gateway}:${POSTGRES_PASSWORD:-gateway_secret}@postgres:5432/${POSTGRES_DB:-ai_gateway}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      JWT_SECRET: ${JWT_SECRET:-super_secret_jwt_key_change_in_production}
+    ports:
+      - "3001:3001"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - gateway_net
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./packages/server
+      dockerfile: Dockerfile
+      target: production
+    command: ["node", "dist/worker.js"]
+    environment:
+      NODE_ENV: production
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgresql://${POSTGRES_USER:-gateway}:${POSTGRES_PASSWORD:-gateway_secret}@postgres:5432/${POSTGRES_DB:-ai_gateway}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - gateway_net
+    restart: unless-stopped
+    deploy:
+      replicas: 2
+
+  dashboard:
+    build:
+      context: ./packages/dashboard
+      dockerfile: Dockerfile
+    container_name: ai_gateway_dashboard
+    ports:
+      - "3000:80"
+    depends_on:
+      - api-server
+    networks:
+      - gateway_net
+
+# ─────────────────────────────────────────────
+# Volumes & Networks
+# ─────────────────────────────────────────────
+volumes:
+  redis_data:
+    driver: local
+  postgres_data:
+    driver: local
+
+networks:
+  gateway_net:
+    driver: bridge

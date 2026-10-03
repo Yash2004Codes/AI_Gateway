@@ -1,0 +1,23 @@
+{
+  "name": "ai-gateway",
+  "version": "1.0.0",
+  "description": "Enterprise AI Gateway - Centralized LLM proxy with rate limiting, failover, and real-time monitoring",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently \"npm run dev --workspace=packages/server\" \"npm run dev --workspace=packages/dashboard\"",
+    "dev:server": "npm run dev --workspace=packages/server",
+    "dev:dashboard": "npm run dev --workspace=packages/dashboard",
+    "dev:worker": "npm run dev:worker --workspace=packages/server",
+    "docker:up": "docker-compose up -d",
+    "docker:down": "docker-compose down",
+    "docker:logs": "docker-compose logs -f",
+    "test:load": "npm run test:load --workspace=packages/server",
+    "setup": "node scripts/setup.js"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
