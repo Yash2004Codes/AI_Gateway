@@ -1,0 +1,219 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 930" width="1440" height="930" role="img" aria-labelledby="t d">
+  <title id="t">AI Gateway architecture</title>
+  <desc id="d">Tenant apps post to the API server (auth, idempotency, validation, sliding-window rate limit, enqueue to a per-tenant lane) and get 202 or 429. Workers run a fair-share scheduler, a BullMQ consumer and a dispatcher that calls OpenAI, Anthropic or Gemini with circuit breakers and failover. Redis holds all shared state; PostgreSQL holds tenants, models, requests and the token ledger.</desc>
+
+  <style>
+    svg { --bg: #f3f5f8; --panel: #ffffff; --fg: #18202c; --muted: #586375; --line: #c6cedb; --accent: #2459c4; }
+    @media (prefers-color-scheme: dark) {
+      svg { --bg: #0f141b; --panel: #161d27; --fg: #e3e8ef; --muted: #93a0b2; --line: #2f3a4a; --accent: #74a3ff; }
+    }
+    .bg { fill: var(--bg); }
+    .node { fill: var(--panel); stroke: var(--line); stroke-width: 1.5; }
+    .node-strong { fill: var(--panel); stroke: var(--fg); stroke-width: 1.5; }
+    .lbl { fill: var(--fg); font: 600 14px -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    .sub { fill: var(--muted); font: 11.5px ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
+    .title { fill: var(--fg); font: 700 15px -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    .heading { fill: var(--fg); font: 700 22px -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    .elbl { fill: var(--muted); font: 12px -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    .elbl-accent { fill: var(--accent); font: 500 12px -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    .edge { stroke: var(--fg); stroke-width: 1.5; fill: none; }
+    .edge-accent { stroke: var(--accent); stroke-width: 2; fill: none; }
+    .dash { stroke-dasharray: 5 4; }
+    .mk { fill: var(--fg); }
+    .mk-accent { fill: var(--accent); }
+    .sw-accent { fill: var(--accent); }
+    .sw-fg { fill: var(--fg); }
+  </style>
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path class="mk" d="M0 0 L10 5 L0 10 z"/>
+    </marker>
+    <marker id="ar-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path class="mk-accent" d="M0 0 L10 5 L0 10 z"/>
+    </marker>
+  </defs>
+  <rect class="bg" x="0" y="0" width="1440" height="930"/>
+  <text class="heading" x="20" y="36">AI Gateway architecture</text>
+  <g transform="translate(0 30)">
+
+          <!-- Clients -->
+          <rect class="node" x="20" y="85" width="170" height="64" rx="6"/>
+          <text class="lbl" x="105" y="111" text-anchor="middle">Tenant apps</text>
+          <text class="sub" x="105" y="130" text-anchor="middle">X-Api-Key</text>
+
+          <rect class="node" x="20" y="200" width="170" height="80" rx="6"/>
+          <text class="lbl" x="105" y="230" text-anchor="middle">nginx</text>
+          <text class="sub" x="105" y="249" text-anchor="middle">serves the SPA,</text>
+          <text class="sub" x="105" y="265" text-anchor="middle">proxies /api</text>
+
+          <rect class="node" x="20" y="330" width="170" height="60" rx="6"/>
+          <text class="lbl" x="105" y="356" text-anchor="middle">Admin browser</text>
+          <text class="sub" x="105" y="374" text-anchor="middle">React dashboard</text>
+
+          <!-- API server -->
+          <rect class="node-strong" x="260" y="40" width="600" height="260" rx="8"/>
+          <text class="title" x="275" y="64">API server · Express + Socket.IO</text>
+          <text class="sub" x="845" y="64" text-anchor="end">:3001, stateless</text>
+
+          <rect class="node" x="275" y="85" width="100" height="64" rx="5"/>
+          <text class="lbl" x="325" y="112" text-anchor="middle">Auth</text>
+          <text class="sub" x="325" y="131" text-anchor="middle">SHA-256 key</text>
+          <rect class="node" x="391" y="85" width="100" height="64" rx="5"/>
+          <text class="lbl" x="441" y="112" text-anchor="middle">Idempotency</text>
+          <text class="sub" x="441" y="131" text-anchor="middle">per tenant</text>
+          <rect class="node" x="507" y="85" width="100" height="64" rx="5"/>
+          <text class="lbl" x="557" y="112" text-anchor="middle">Validate</text>
+          <text class="sub" x="557" y="131" text-anchor="middle">body</text>
+          <rect class="node" x="623" y="85" width="100" height="64" rx="5"/>
+          <text class="lbl" x="673" y="112" text-anchor="middle">Rate limit</text>
+          <text class="sub" x="673" y="131" text-anchor="middle">sliding, Lua</text>
+          <rect class="node" x="739" y="85" width="100" height="64" rx="5"/>
+          <text class="lbl" x="789" y="112" text-anchor="middle">Enqueue</text>
+          <text class="sub" x="789" y="131" text-anchor="middle">row + lane</text>
+          <line class="edge-accent" x1="375" y1="117" x2="389" y2="117" marker-end="url(#ar-accent)"/>
+          <line class="edge-accent" x1="491" y1="117" x2="505" y2="117" marker-end="url(#ar-accent)"/>
+          <line class="edge-accent" x1="607" y1="117" x2="621" y2="117" marker-end="url(#ar-accent)"/>
+          <line class="edge-accent" x1="723" y1="117" x2="737" y2="117" marker-end="url(#ar-accent)"/>
+
+          <text class="sub" x="275" y="188">control plane</text>
+          <rect class="node" x="275" y="200" width="180" height="80" rx="5"/>
+          <text class="lbl" x="365" y="228" text-anchor="middle">Admin API</text>
+          <text class="sub" x="365" y="247" text-anchor="middle">JWT + RBAC</text>
+          <text class="sub" x="365" y="263" text-anchor="middle">tenants, chaos, demo</text>
+          <rect class="node" x="470" y="200" width="180" height="80" rx="5"/>
+          <text class="lbl" x="560" y="228" text-anchor="middle">Socket.IO hub</text>
+          <text class="sub" x="560" y="247" text-anchor="middle">JWT on connect</text>
+          <text class="sub" x="560" y="263" text-anchor="middle">snapshot every 2 s</text>
+          <rect class="node" x="665" y="200" width="180" height="80" rx="5"/>
+          <text class="lbl" x="755" y="228" text-anchor="middle">Traffic generator</text>
+          <text class="sub" x="755" y="247" text-anchor="middle">DEMO_MODE only</text>
+          <text class="sub" x="755" y="263" text-anchor="middle">calls /completions</text>
+
+          <!-- Client edges -->
+          <line class="edge-accent" x1="190" y1="105" x2="273" y2="105" marker-end="url(#ar-accent)"/>
+          <text class="elbl-accent" x="231" y="97" text-anchor="middle">POST</text>
+          <line class="edge dash" x1="275" y1="137" x2="192" y2="137" marker-end="url(#ar)"/>
+          <text class="elbl" x="231" y="160" text-anchor="middle">202 / 429</text>
+          <text class="elbl" x="231" y="175" text-anchor="middle">then poll</text>
+          <line class="edge" x1="105" y1="330" x2="105" y2="282" marker-end="url(#ar)"/>
+          <text class="elbl" x="113" y="311">HTTPS</text>
+          <line class="edge" x1="190" y1="240" x2="273" y2="240" marker-end="url(#ar)"/>
+          <text class="elbl" x="231" y="232" text-anchor="middle">proxy</text>
+
+          <!-- Workers -->
+          <rect class="node-strong" x="920" y="40" width="300" height="305" rx="8"/>
+          <text class="title" x="935" y="64">Workers ×2</text>
+          <text class="sub" x="1205" y="64" text-anchor="end">scale out</text>
+          <rect class="node" x="935" y="80" width="270" height="48" rx="5"/>
+          <text class="lbl" x="1070" y="100" text-anchor="middle">Fair scheduler</text>
+          <text class="sub" x="1070" y="118" text-anchor="middle">1 job per tenant per turn</text>
+          <rect class="node" x="935" y="144" width="270" height="48" rx="5"/>
+          <text class="lbl" x="1070" y="164" text-anchor="middle">BullMQ consumer</text>
+          <text class="sub" x="1070" y="182" text-anchor="middle">5 concurrent, 3 attempts</text>
+          <rect class="node" x="935" y="208" width="270" height="60" rx="5"/>
+          <text class="lbl" x="1070" y="230" text-anchor="middle">Dispatcher</text>
+          <text class="sub" x="1070" y="248" text-anchor="middle">breaker → chaos → vendor</text>
+          <text class="sub" x="1070" y="262" text-anchor="middle">next vendor on 429/5xx</text>
+          <rect class="node" x="935" y="284" width="130" height="48" rx="5"/>
+          <text class="lbl" x="1000" y="304" text-anchor="middle">Ledger</text>
+          <text class="sub" x="1000" y="322" text-anchor="middle">500 ms batches</text>
+          <rect class="node" x="1075" y="284" width="130" height="48" rx="5"/>
+          <text class="lbl" x="1140" y="304" text-anchor="middle">Webhook</text>
+          <text class="sub" x="1140" y="322" text-anchor="middle">pinned IP</text>
+          <line class="edge-accent" x1="1070" y1="128" x2="1070" y2="142" marker-end="url(#ar-accent)"/>
+          <line class="edge-accent" x1="1070" y1="192" x2="1070" y2="206" marker-end="url(#ar-accent)"/>
+          <line class="edge" x1="1000" y1="268" x2="1000" y2="282" marker-end="url(#ar)"/>
+          <line class="edge" x1="1140" y1="268" x2="1140" y2="282" marker-end="url(#ar)"/>
+
+          <!-- Vendors + client webhook -->
+          <text class="title" x="1345" y="140" text-anchor="middle">LLM vendors</text>
+          <rect class="node" x="1270" y="150" width="150" height="26" rx="5"/>
+          <text class="lbl" x="1345" y="168" text-anchor="middle">1 · OpenAI</text>
+          <rect class="node" x="1270" y="182" width="150" height="26" rx="5"/>
+          <text class="lbl" x="1345" y="200" text-anchor="middle">2 · Anthropic</text>
+          <rect class="node" x="1270" y="214" width="150" height="26" rx="5"/>
+          <text class="lbl" x="1345" y="232" text-anchor="middle">3 · Gemini</text>
+          <text class="sub" x="1345" y="256" text-anchor="middle">live if key set, else mock</text>
+          <line class="edge-accent" x1="1205" y1="238" x2="1245" y2="238"/>
+          <line class="edge-accent" x1="1245" y1="163" x2="1245" y2="238"/>
+          <line class="edge-accent" x1="1245" y1="163" x2="1268" y2="163" marker-end="url(#ar-accent)"/>
+          <line class="edge-accent" x1="1245" y1="195" x2="1268" y2="195" marker-end="url(#ar-accent)"/>
+          <line class="edge-accent" x1="1245" y1="227" x2="1268" y2="227" marker-end="url(#ar-accent)"/>
+
+          <rect class="node" x="1270" y="290" width="150" height="40" rx="5"/>
+          <text class="lbl" x="1345" y="315" text-anchor="middle">Client webhook</text>
+          <line class="edge" x1="1205" y1="310" x2="1268" y2="310" marker-end="url(#ar)"/>
+          <text class="elbl" x="1345" y="348" text-anchor="middle">SSRF-safe POST result</text>
+
+          <!-- Redis -->
+          <rect class="node-strong" x="260" y="420" width="960" height="210" rx="8"/>
+          <text class="title" x="275" y="444">Redis 7 · shared state for every replica</text>
+          <rect class="node" x="275" y="455" width="222" height="70" rx="5"/>
+          <text class="lbl" x="386" y="484" text-anchor="middle">API key cache</text>
+          <text class="sub" x="386" y="504" text-anchor="middle">apikey:* · 5 min TTL</text>
+          <rect class="node" x="511" y="455" width="222" height="70" rx="5"/>
+          <text class="lbl" x="622" y="484" text-anchor="middle">Idempotency</text>
+          <text class="sub" x="622" y="504" text-anchor="middle">idempotency:tenant:key</text>
+          <rect class="node" x="747" y="455" width="222" height="70" rx="5"/>
+          <text class="lbl" x="858" y="484" text-anchor="middle">Rate windows</text>
+          <text class="sub" x="858" y="504" text-anchor="middle">rl:tpm · rl:rpm, 1 s buckets</text>
+          <rect class="node" x="983" y="455" width="222" height="70" rx="5"/>
+          <text class="lbl" x="1094" y="484" text-anchor="middle">Fair-share lanes</text>
+          <text class="sub" x="1094" y="504" text-anchor="middle">fair:lane:* · fair:ring</text>
+          <rect class="node" x="275" y="540" width="222" height="70" rx="5"/>
+          <text class="lbl" x="386" y="569" text-anchor="middle">BullMQ queue</text>
+          <text class="sub" x="386" y="589" text-anchor="middle">short buffer, retries</text>
+          <rect class="node" x="511" y="540" width="222" height="70" rx="5"/>
+          <text class="lbl" x="622" y="569" text-anchor="middle">Circuit breakers</text>
+          <text class="sub" x="622" y="589" text-anchor="middle">cb:provider:*</text>
+          <rect class="node" x="747" y="540" width="222" height="70" rx="5"/>
+          <text class="lbl" x="858" y="569" text-anchor="middle">Chaos config</text>
+          <text class="sub" x="858" y="589" text-anchor="middle">chaos:providers</text>
+          <rect class="node" x="983" y="540" width="222" height="70" rx="5"/>
+          <text class="lbl" x="1094" y="569" text-anchor="middle">Pub/Sub</text>
+          <text class="sub" x="1094" y="589" text-anchor="middle">job:updates · provider:health</text>
+
+          <!-- Postgres -->
+          <rect class="node-strong" x="260" y="680" width="960" height="150" rx="8"/>
+          <text class="title" x="275" y="704">PostgreSQL 16 · source of truth and audit</text>
+          <rect class="node" x="275" y="715" width="300" height="44" rx="5"/>
+          <text class="lbl" x="290" y="742">tenants</text>
+          <text class="sub" x="560" y="742" text-anchor="end">key hash, TPM/RPM</text>
+          <rect class="node" x="590" y="715" width="300" height="44" rx="5"/>
+          <text class="lbl" x="605" y="742">providers · models</text>
+          <text class="sub" x="875" y="742" text-anchor="end">priority, prices</text>
+          <rect class="node" x="905" y="715" width="300" height="44" rx="5"/>
+          <text class="lbl" x="920" y="742">users</text>
+          <text class="sub" x="1190" y="742" text-anchor="end">bcrypt, roles</text>
+          <rect class="node" x="275" y="770" width="300" height="44" rx="5"/>
+          <text class="lbl" x="290" y="797">gateway_requests</text>
+          <text class="sub" x="560" y="797" text-anchor="end">monthly partitions</text>
+          <rect class="node" x="590" y="770" width="300" height="44" rx="5"/>
+          <text class="lbl" x="605" y="797">token_usage_ledger</text>
+          <text class="sub" x="875" y="797" text-anchor="end">billing audit</text>
+          <rect class="node" x="905" y="770" width="300" height="44" rx="5"/>
+          <text class="lbl" x="920" y="797">provider_health_events</text>
+          <text class="sub" x="1190" y="797" text-anchor="end">error rate</text>
+
+          <!-- API <-> Redis, Workers <-> Redis -->
+          <line class="edge-accent" x1="560" y1="302" x2="560" y2="418" marker-start="url(#ar-accent)" marker-end="url(#ar-accent)"/>
+          <text class="elbl-accent" x="570" y="352">key lookup · SET NX · check and admit</text>
+          <text class="elbl-accent" x="570" y="368">push to lane · subscribe to events</text>
+          <line class="edge-accent" x1="1000" y1="347" x2="1000" y2="418" marker-start="url(#ar-accent)" marker-end="url(#ar-accent)"/>
+          <text class="elbl-accent" x="1010" y="378">pop lane · consume job</text>
+          <text class="elbl-accent" x="1010" y="394">breaker · chaos · publish</text>
+
+          <!-- API -> Postgres (left), Workers -> Postgres (right) -->
+          <polyline class="edge" points="260,270 236,270 236,792 273,792" marker-end="url(#ar)"/>
+          <text class="elbl" x="0" y="0" transform="translate(228 560) rotate(-90)" text-anchor="middle">insert request · admin reads · login</text>
+          <polyline class="edge" points="1220,330 1246,330 1246,792 1207,792" marker-end="url(#ar)"/>
+          <text class="elbl" x="0" y="0" transform="translate(1260 560) rotate(90)" text-anchor="middle">status · ledger · health events</text>
+        
+  </g>
+  <rect class="sw-accent" x="260" y="894" width="12" height="12" rx="2"/>
+  <text class="elbl" x="280" y="905">LLM request path</text>
+  <rect class="sw-fg" x="420" y="894" width="12" height="12" rx="2"/>
+  <text class="elbl" x="440" y="905">control traffic and writes</text>
+  <line class="edge dash" x1="620" y1="900" x2="650" y2="900"/>
+  <text class="elbl" x="658" y="905">response to client</text>
+</svg>

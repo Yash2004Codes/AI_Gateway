@@ -8,73 +8,14 @@
 
 ## 🏗️ Architecture Overview
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         Client Applications                         │
-└────────────────────────────┬────────────────────────────────────────┘
-                             │  POST /api/v1/gateway/completions
-                             │  X-Api-Key: <tenant-api-key>
-                             ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│              Express API Server (Node.js + Socket.io)               │
-│                                                                     │
-│  1. Authenticate: SHA-256(API key) → Redis cache → PostgreSQL       │
-│  2. Idempotency-Key header → Redis (tenant-scoped, 24h)             │
-│  3. Validate body                                                   │
-│  4. TPM + RPM check → Redis sliding window (atomic Lua)             │
-│  5. Persist request → PostgreSQL gateway_requests                   │
-│  6. Push job into the tenant's fair-share lane                      │
-│  7. Return HTTP 202 Accepted immediately                            │
-└────────────────────────────┬────────────────────────────────────────┘
-                             │
-          Per-tenant lanes (Redis ZSETs) + round-robin ring
-          ┌─────────┐ ┌─────────┐ ┌──────────────────┐
-          │ Acme  ▮ │ │Globex ▮ │ │Initech ▮▮▮▮▮▮▮▮▮ │
-          └────┬────┘ └────┬────┘ └────────┬─────────┘
-               └─ scheduler pops 1 job per tenant per turn ─┘
-                             │
-                 BullMQ queue (small buffer, Redis)
-                             │
-                  ┌──────────┴──────────┐
-                  ▼                     ▼
-          ┌──────────────┐    ┌──────────────────┐
-          │   Worker 1   │    │    Worker 2       │
-          │  (BullMQ)    │    │   (BullMQ)        │
-          └──────┬───────┘    └────────┬──────────┘
-                 │                     │
-                 ▼                     ▼
-         ┌───────────────────────────────────────┐
-         │         Provider Dispatcher            │
-         │  Priority → OpenAI → Anthropic → Gemini│
-         │  Distributed circuit breaker (Lua)     │
-         │  Auto-failover on 429/5xx              │
-         │  SSRF-safe callback delivery           │
-         └──────────────────┬────────────────────┘
-                            │
-              ┌─────────────┼─────────────┐
-              ▼             ▼             ▼
-          OpenAI       Anthropic       Gemini
-        gpt-5-mini  claude-haiku-5-5  gemini-2.5-flash
-     (each vendor runs live if its API key is set, simulated otherwise)
+![AI Gateway architecture: tenant apps, API server, workers, LLM vendors, Redis and PostgreSQL](docs/architecture.svg)
 
-                            │ Results
-                            ▼
-         ┌──────────────────────────────────────┐
-         │   PostgreSQL                          │
-         │   - gateway_requests (status update)  │
-         │   - token_usage_ledger (billing audit)│
-         │   - provider_health_events            │
-         └──────────────────────────────────────┘
-                            │
-                     Redis Pub/Sub
-                            │
-                            ▼
-         ┌──────────────────────────────────────┐
-         │   Socket.io → React Dashboard        │
-         │   Live provider health, queue depth,  │
-         │   failover events, cost tracking      │
-         └──────────────────────────────────────┘
-```
+- **API server** (stateless): authenticates the tenant, deduplicates retries, enforces the sliding-window
+  TPM/RPM limit, writes the request row, pushes the job into the tenant's lane, and returns `202 Accepted`.
+- **Workers** (scale out): the fair scheduler takes one job per tenant per turn into a short BullMQ buffer;
+  the dispatcher calls vendors in priority order, skipping any whose circuit breaker is open.
+- **Redis** holds every piece of shared state, so any number of API and worker replicas agree on limits,
+  lanes and vendor health. **PostgreSQL** is the source of truth and the billing audit trail.
 
 ### Detailed Flow Architecture
 
@@ -120,9 +61,9 @@ graph TD
 
     %% External LLMs
     subgraph LLMProviders [LLM Providers]
-        OpenAI[OpenAI - GPT-4o]:::external
-        Anthropic[Anthropic - Claude 3.5]:::external
-        Gemini[Google - Gemini 1.5]:::external
+        OpenAI[OpenAI - gpt-5-mini]:::external
+        Anthropic[Anthropic - claude-haiku-5-5]:::external
+        Gemini[Google - gemini-2.5-flash]:::external
     end
 
     %% Observability Layer
@@ -370,3 +311,10 @@ ai-gateway/
 ├── .env.example
 └── scripts/setup.js
 ```
+
+
+---
+
+## 👤 Author
+
+**Yash Sharma** — [GitHub](https://github.com/Yash2004Codes)
