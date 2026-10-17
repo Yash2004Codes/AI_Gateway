@@ -68,6 +68,93 @@
          └──────────────────────────────────────┘
 ```
 
+### Detailed Flow Architecture
+
+```mermaid
+graph TD
+    %% Define Styles
+    classDef client fill:#f9f,stroke:#333,stroke-width:2px,color:#000;
+    classDef api fill:#bbf,stroke:#333,stroke-width:2px,color:#000;
+    classDef db fill:#fdb,stroke:#333,stroke-width:2px,color:#000;
+    classDef cache fill:#fbd,stroke:#333,stroke-width:2px,color:#000;
+    classDef worker fill:#dfd,stroke:#333,stroke-width:2px,color:#000;
+    classDef external fill:#ddd,stroke:#333,stroke-width:2px,color:#000;
+    classDef ui fill:#ffb,stroke:#333,stroke-width:2px,color:#000;
+
+    %% Client Layer
+    Client[Client Applications]:::client
+    
+    %% API Layer
+    subgraph APILayer [API Layer]
+        API[Gateway API]:::api
+        Auth[API Key Validator]:::api
+        RateLimit[TPM Rate Limiter]:::api
+        Idempotency[Idempotency Check]:::api
+    end
+
+    %% Data Layer
+    subgraph StateDataLayer [State & Data Layer]
+        RedisCache[(Redis: Cache & PubSub)]:::cache
+        Postgres[(PostgreSQL: Ledger)]:::db
+    end
+
+    %% Queue Layer
+    subgraph QueueLayer [Queue Layer]
+        BullMQ[BullMQ Queue]:::cache
+    end
+
+    %% Worker Layer
+    subgraph WorkerPool [Worker Pool]
+        Worker1[Worker 1]:::worker
+        Worker2[Worker 2]:::worker
+        Dispatcher[Provider Dispatcher & Circuit Breaker]:::worker
+    end
+
+    %% External LLMs
+    subgraph LLMProviders [LLM Providers]
+        OpenAI[OpenAI - GPT-4o]:::external
+        Anthropic[Anthropic - Claude 3.5]:::external
+        Gemini[Google - Gemini 1.5]:::external
+    end
+
+    %% Observability Layer
+    subgraph MonitoringUI [Monitoring & UI]
+        SocketIO[Socket.io Server]:::api
+        Dashboard[React Admin Dashboard]:::ui
+    end
+
+    %% Flow: Ingestion
+    Client -- "1. POST Request" --> API
+    API --> Auth
+    Auth -- "2. Verify Tenant" --> Postgres
+    API --> Idempotency
+    Idempotency -- "3. Check Duplicate" --> RedisCache
+    API --> RateLimit
+    RateLimit -- "4. Check Quota" --> RedisCache
+    API -- "5. Save Status (queued)" --> Postgres
+    API -- "6. Enqueue Job" --> BullMQ
+    API -- "7. Return HTTP 202" --> Client
+
+    %% Flow: Processing
+    BullMQ -- "8. Pull Job (Round-Robin)" --> Worker1
+    BullMQ -.-> Worker2
+    Worker1 --> Dispatcher
+    
+    %% Flow: LLM Dispatch
+    Dispatcher -- "9a. Primary Call" --> OpenAI
+    Dispatcher -- "9b. Failover" --> Anthropic
+    Dispatcher -- "9c. Failover" --> Gemini
+
+    %% Flow: Post-Processing
+    Worker1 -- "10. Log Cost & Status" --> Postgres
+    Worker1 -- "11. Webhook Alert" --> Client
+    Worker1 -- "12. Emit Job Update" --> RedisCache
+
+    %% Flow: Real-time Updates
+    RedisCache -- "13. Pub/Sub" --> SocketIO
+    SocketIO -- "14. WebSockets" --> Dashboard
+```
+
 ---
 
 ## 🚀 Quick Start
@@ -86,6 +173,9 @@ node scripts/setup.js
 
 # 2. Edit .env with your API keys
 # OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY
+# No keys yet? Set LLM_MOCK_MODE=true to simulate vendor responses
+# (LLM_MOCK_FAILURE_RATE=0.3 exercises failover + circuit breaker)
+# Set the same values in packages/server/.env (the server reads its own cwd)
 
 # 3. Start Redis + PostgreSQL
 docker-compose up -d redis postgres

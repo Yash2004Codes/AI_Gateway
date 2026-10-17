@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { queryOne } from '../db/pool';
 import { logger } from '../utils/logger';
+import { hashApiKey, getCachedTenant, cacheTenant, CachedTenant } from '../utils/apiKey';
 
 export interface AuthenticatedRequest extends Request {
   tenant?: {
@@ -36,28 +37,34 @@ export async function apiKeyAuth(
   }
 
   try {
-    const tenant = await queryOne<{
-      id: string;
-      name: string;
-      tpm_limit: number;
-      rpm_limit: number;
-      is_active: boolean;
-    }>(
-      'SELECT id, name, tpm_limit, rpm_limit, is_active FROM tenants WHERE api_key = $1',
-      [apiKey]
-    );
+    const hash = hashApiKey(apiKey);
 
-    if (!tenant || !tenant.is_active) {
+    // Redis cache first (positive + negative), then Postgres on miss
+    let tenant: CachedTenant | null | undefined = await getCachedTenant(hash);
+
+    if (tenant === undefined) {
+      const row = await queryOne<{
+        id: string;
+        name: string;
+        tpm_limit: number;
+        rpm_limit: number;
+      }>(
+        'SELECT id, name, tpm_limit, rpm_limit FROM tenants WHERE api_key_hash = $1 AND is_active = true',
+        [hash]
+      );
+
+      tenant = row
+        ? { id: row.id, name: row.name, tpmLimit: row.tpm_limit, rpmLimit: row.rpm_limit }
+        : null;
+      await cacheTenant(hash, tenant);
+    }
+
+    if (!tenant) {
       res.status(401).json({ error: 'Invalid or inactive API key', code: 'INVALID_API_KEY' });
       return;
     }
 
-    req.tenant = {
-      id: tenant.id,
-      name: tenant.name,
-      tpmLimit: tenant.tpm_limit,
-      rpmLimit: tenant.rpm_limit,
-    };
+    req.tenant = tenant;
 
     next();
   } catch (err) {
@@ -82,25 +89,34 @@ export async function jwtAuth(
   }
 
   try {
-    const secret = process.env.JWT_SECRET ?? 'default_secret';
-    const decoded = jwt.verify(token, secret) as {
-      userId: string;
-      email: string;
-      role: string;
-      tenantId?: string;
-    };
-
-    req.user = {
-      id: decoded.userId,
-      email: decoded.email,
-      role: decoded.role,
-      tenantId: decoded.tenantId,
-    };
-
+    req.user = verifyJwt(token);
     next();
   } catch (err) {
     res.status(401).json({ error: 'Invalid or expired token', code: 'INVALID_TOKEN' });
   }
+}
+
+// Shared by the HTTP middleware and the Socket.IO handshake
+export function verifyJwt(token: string): NonNullable<AuthenticatedRequest['user']> {
+  const decoded = jwt.verify(token, getJwtSecret()) as {
+    userId: string;
+    email: string;
+    role: string;
+    tenantId?: string;
+  };
+
+  return {
+    id: decoded.userId,
+    email: decoded.email,
+    role: decoded.role,
+    tenantId: decoded.tenantId,
+  };
+}
+
+export function getJwtSecret(): string {
+  const secret = process.env.JWT_SECRET;
+  if (!secret) throw new Error('JWT_SECRET is not set');
+  return secret;
 }
 
 // ─────────────────────────────────────────────

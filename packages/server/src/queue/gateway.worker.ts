@@ -130,7 +130,16 @@ async function processGatewayJob(
       providersTried: dispatchResult.providersTried,
     };
   } catch (dispatchError: any) {
-    // All providers failed
+    // All providers failed. Only mark the request failed on the final attempt;
+    // earlier attempts go back to 'queued' because BullMQ will retry them.
+    const isFinalAttempt = job.attemptsMade + 1 >= (job.opts.attempts ?? 1);
+    if (!isFinalAttempt) {
+      await updateRequestStatus(requestId, 'queued', {
+        error_message: dispatchError.message,
+      });
+      throw dispatchError;
+    }
+
     await updateRequestStatus(requestId, 'failed', {
       error_code: 'ALL_PROVIDERS_FAILED',
       error_message: dispatchError.message,

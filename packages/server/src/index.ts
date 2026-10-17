@@ -4,6 +4,7 @@
 
 import 'dotenv/config';
 import express from 'express';
+import 'express-async-errors'; // route rejections reach the error handler instead of hanging
 import http from 'http';
 import cors from 'cors';
 import helmet from 'helmet';

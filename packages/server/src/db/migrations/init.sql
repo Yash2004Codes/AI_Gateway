@@ -13,7 +13,8 @@ CREATE EXTENSION IF NOT EXISTS "pg_stat_statements";
 CREATE TABLE IF NOT EXISTS tenants (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     name VARCHAR(255) NOT NULL UNIQUE,
-    api_key VARCHAR(64) NOT NULL UNIQUE,
+    api_key_hash CHAR(64) NOT NULL UNIQUE,   -- SHA-256 hex of the raw key; raw key is never stored
+    api_key_prefix VARCHAR(16) NOT NULL,     -- non-secret prefix for identifying a key in the UI
     tpm_limit INTEGER NOT NULL DEFAULT 10000,
     rpm_limit INTEGER NOT NULL DEFAULT 100,
     monthly_token_budget BIGINT DEFAULT NULL,
@@ -243,16 +244,22 @@ VALUES
     ((SELECT id FROM gemini_id), 'gemini-1.5-flash', 'Gemini 1.5 Flash', 1000000, 0.000075, 0.0003)
 ON CONFLICT (provider_id, name) DO NOTHING;
 
--- Seed: Demo tenant
-INSERT INTO tenants (name, api_key, tpm_limit, rpm_limit)
-VALUES ('Demo Tenant', 'demo-api-key-change-in-production', 50000, 500)
+-- Seed: Demo tenant (raw key: demo-api-key-change-in-production)
+INSERT INTO tenants (name, api_key_hash, api_key_prefix, tpm_limit, rpm_limit)
+VALUES (
+    'Demo Tenant',
+    encode(sha256(convert_to('demo-api-key-change-in-production', 'UTF8')), 'hex'),
+    'demo-api-ke',
+    50000,
+    500
+)
 ON CONFLICT (name) DO NOTHING;
 
 -- Seed: Admin user (password: admin123 - CHANGE IN PRODUCTION)
 INSERT INTO users (email, password_hash, name, role)
 VALUES (
     'admin@gateway.local',
-    '$2a$10$rQnuz6pKORyDvHMSAFeBb.xhHpUF9JUlBIjL3AKd/8PjmK7M.V.R2',
+    '$2a$10$NGRDuTd0Te5BvYNRTNjFjOFIpBQAh.Se4JS4X7T6WbQED4ccmUPd.',
     'System Admin',
     'admin'
 )

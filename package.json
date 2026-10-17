@@ -7,7 +7,7 @@
     "packages/*"
   ],
   "scripts": {
-    "dev": "concurrently \"npm run dev --workspace=packages/server\" \"npm run dev --workspace=packages/dashboard\"",
+    "dev": "concurrently -n api,worker,web \"npm run dev --workspace=packages/server\" \"npm run dev:worker --workspace=packages/server\" \"npm run dev --workspace=packages/dashboard\"",
     "dev:server": "npm run dev --workspace=packages/server",
     "dev:dashboard": "npm run dev --workspace=packages/dashboard",
     "dev:worker": "npm run dev:worker --workspace=packages/server",

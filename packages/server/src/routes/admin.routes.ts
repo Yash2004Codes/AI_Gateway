@@ -2,10 +2,11 @@ import { Router, Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { queryOne, query } from '../db/pool';
-import { jwtAuth, requireRole, AuthenticatedRequest } from '../middleware/auth.middleware';
+import { jwtAuth, requireRole, AuthenticatedRequest, getJwtSecret } from '../middleware/auth.middleware';
 import { getQueueMetrics } from '../queue/gateway.queue';
 import { getCachedMetrics, cacheMetrics } from '../db/redis';
-import { logger } from '../utils/logger';
+import { generateApiKey } from '../utils/apiKey';
+import { circuitBreaker } from '../utils/redisCircuitBreaker';
 
 const router = Router();
 
@@ -45,7 +46,7 @@ router.post('/auth/login', async (req: Request, res: Response): Promise<void> =>
 
   const token = jwt.sign(
     { userId: user.id, email: user.email, role: user.role, tenantId: user.tenant_id },
-    process.env.JWT_SECRET ?? 'default_secret',
+    getJwtSecret(),
     { expiresIn: '24h' }
   );
 
@@ -152,7 +153,8 @@ router.get(
     const limit = Math.min(parseInt(req.query.limit as string ?? '50', 10), 200);
     const status = req.query.status as string | undefined;
 
-    const statusFilter = status ? `AND gr.status = '${status}'` : '';
+    const statusFilter = status ? 'WHERE gr.status = $2' : '';
+    const params: unknown[] = [limit, ...(status ? [status] : [])];
 
     const requests = await query(`
       SELECT
@@ -166,7 +168,7 @@ router.get(
       ${statusFilter}
       ORDER BY gr.created_at DESC
       LIMIT $1
-    `, [limit]);
+    `, params);
 
     res.json({ requests });
   }
@@ -203,16 +205,22 @@ router.post(
   requireRole('admin'),
   async (req: AuthenticatedRequest, res: Response): Promise<void> => {
     const { name, tpmLimit = 10000, rpmLimit = 100 } = req.body;
-    const apiKey = `gw-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    if (!name || typeof name !== 'string') {
+      res.status(400).json({ error: 'name is required' });
+      return;
+    }
+
+    const { apiKey, hash, prefix } = generateApiKey();
 
     const tenant = await queryOne(
-      `INSERT INTO tenants (name, api_key, tpm_limit, rpm_limit)
-       VALUES ($1, $2, $3, $4)
-       RETURNING id, name, api_key, tpm_limit, rpm_limit, created_at`,
-      [name, apiKey, tpmLimit, rpmLimit]
+      `INSERT INTO tenants (name, api_key_hash, api_key_prefix, tpm_limit, rpm_limit)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, name, api_key_prefix, tpm_limit, rpm_limit, created_at`,
+      [name, hash, prefix, tpmLimit, rpmLimit]
     );
 
-    res.status(201).json(tenant);
+    // The raw key is returned exactly once; only its hash is persisted
+    res.status(201).json({ ...tenant, api_key: apiKey });
   }
 );
 
@@ -242,8 +250,6 @@ router.get(
     res.json({ providers, models });
   }
 );
-
-import { circuitBreaker } from '../utils/redisCircuitBreaker';
 
 // ─────────────────────────────────────────────
 // GET /api/v1/admin/circuit-breaker/:provider

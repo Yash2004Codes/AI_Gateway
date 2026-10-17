@@ -4,9 +4,7 @@
 // Implements the circuit-breaker + failover pattern
 // ═══════════════════════════════════════════════════════
 
-import OpenAI from 'openai';
-import Anthropic from '@anthropic-ai/sdk';
-import axios from 'axios';
+import { getProvider } from './llmProviders';
 import { logger } from '../utils/logger';
 import { query, queryOne } from '../db/pool';
 import { publishProviderHealth } from '../db/redis';
@@ -38,141 +36,6 @@ export interface ProviderInfo {
   healthStatus: string;
   errorRate: number;
   avgLatencyMs: number;
-}
-
-// ─────────────────────────────────────────────
-// Cost estimation per provider/model
-// ─────────────────────────────────────────────
-const MODEL_COSTS: Record<string, { input: number; output: number }> = {
-  'gpt-4o': { input: 0.005, output: 0.015 },
-  'gpt-4o-mini': { input: 0.00015, output: 0.0006 },
-  'gpt-3.5-turbo': { input: 0.0005, output: 0.0015 },
-  'claude-3-5-sonnet-20241022': { input: 0.003, output: 0.015 },
-  'claude-3-haiku-20240307': { input: 0.00025, output: 0.00125 },
-  'gemini-1.5-pro': { input: 0.00125, output: 0.005 },
-  'gemini-1.5-flash': { input: 0.000075, output: 0.0003 },
-};
-
-function estimateCost(model: string, promptTokens: number, completionTokens: number): number {
-  const costs = MODEL_COSTS[model] ?? { input: 0.001, output: 0.002 };
-  return (promptTokens / 1000) * costs.input + (completionTokens / 1000) * costs.output;
-}
-
-// ─────────────────────────────────────────────
-// OpenAI Adapter
-// ─────────────────────────────────────────────
-async function callOpenAI(model: string, request: LLMRequest): Promise<LLMResponse> {
-  const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-  const start = Date.now();
-
-  const messages: OpenAI.ChatCompletionMessageParam[] = [];
-  if (request.systemPrompt) {
-    messages.push({ role: 'system', content: request.systemPrompt });
-  }
-  messages.push({ role: 'user', content: request.userMessage });
-
-  const response = await client.chat.completions.create({
-    model,
-    messages,
-    max_tokens: request.maxTokens ?? 1024,
-    temperature: request.temperature ?? 0.7,
-  });
-
-  const latencyMs = Date.now() - start;
-  const usage = response.usage!;
-  const responseText = response.choices[0]?.message?.content ?? '';
-
-  return {
-    provider: 'openai',
-    model,
-    responseText,
-    promptTokens: usage.prompt_tokens,
-    completionTokens: usage.completion_tokens,
-    totalTokens: usage.total_tokens,
-    latencyMs,
-    costUsd: estimateCost(model, usage.prompt_tokens, usage.completion_tokens),
-  };
-}
-
-// ─────────────────────────────────────────────
-// Anthropic Adapter
-// ─────────────────────────────────────────────
-async function callAnthropic(model: string, request: LLMRequest): Promise<LLMResponse> {
-  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-  const start = Date.now();
-
-  const response = await client.messages.create({
-    model,
-    max_tokens: request.maxTokens ?? 1024,
-    system: request.systemPrompt,
-    messages: [{ role: 'user', content: request.userMessage }],
-  });
-
-  const latencyMs = Date.now() - start;
-  const responseText = response.content
-    .filter((c) => c.type === 'text')
-    .map((c) => (c as Anthropic.TextBlock).text)
-    .join('');
-
-  const promptTokens = response.usage.input_tokens;
-  const completionTokens = response.usage.output_tokens;
-
-  return {
-    provider: 'anthropic',
-    model,
-    responseText,
-    promptTokens,
-    completionTokens,
-    totalTokens: promptTokens + completionTokens,
-    latencyMs,
-    costUsd: estimateCost(model, promptTokens, completionTokens),
-  };
-}
-
-// ─────────────────────────────────────────────
-// Google Gemini Adapter
-// ─────────────────────────────────────────────
-async function callGemini(model: string, request: LLMRequest): Promise<LLMResponse> {
-  const apiKey = process.env.GEMINI_API_KEY;
-  const start = Date.now();
-
-  const contents = [];
-  if (request.systemPrompt) {
-    contents.push({ role: 'user', parts: [{ text: request.systemPrompt }] });
-    contents.push({ role: 'model', parts: [{ text: 'Understood.' }] });
-  }
-  contents.push({ role: 'user', parts: [{ text: request.userMessage }] });
-
-  const response = await axios.post(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-    {
-      contents,
-      generationConfig: {
-        maxOutputTokens: request.maxTokens ?? 1024,
-        temperature: request.temperature ?? 0.7,
-      },
-    },
-    { timeout: 30000 }
-  );
-
-  const latencyMs = Date.now() - start;
-  const candidate = response.data.candidates?.[0];
-  const responseText = candidate?.content?.parts?.map((p: any) => p.text).join('') ?? '';
-  const usage = response.data.usageMetadata ?? {};
-
-  const promptTokens = usage.promptTokenCount ?? 0;
-  const completionTokens = usage.candidatesTokenCount ?? 0;
-
-  return {
-    provider: 'gemini',
-    model,
-    responseText,
-    promptTokens,
-    completionTokens,
-    totalTokens: promptTokens + completionTokens,
-    latencyMs,
-    costUsd: estimateCost(model, promptTokens, completionTokens),
-  };
 }
 
 // ─────────────────────────────────────────────
@@ -220,11 +83,12 @@ async function recordHealthEvent(
     );
 
     // Broadcast health update via Redis pub/sub
+    // Field names match the providers table so the dashboard can merge rows directly
     await publishProviderHealth({
-      provider: providerName,
-      healthStatus,
-      errorRate,
-      avgLatencyMs: avgLatency,
+      name: providerName,
+      health_status: healthStatus,
+      error_rate: errorRate,
+      avg_latency_ms: avgLatency,
       timestamp: new Date().toISOString(),
     });
   } catch (err) {
@@ -319,21 +183,12 @@ export async function dispatchToProvider(
 
     try {
       logger.info(`Attempting provider ${provider.name} with model ${provider.model_name}`);
-      let result: LLMResponse;
 
-      switch (provider.name) {
-        case 'openai':
-          result = await callOpenAI(provider.model_name, request);
-          break;
-        case 'anthropic':
-          result = await callAnthropic(provider.model_name, request);
-          break;
-        case 'gemini':
-          result = await callGemini(provider.model_name, request);
-          break;
-        default:
-          throw new Error(`Unknown provider: ${provider.name}`);
-      }
+      // Polymorphism: every provider exposes the same complete() method
+      const result: LLMResponse = await getProvider(provider.name).complete(
+        provider.model_name,
+        request
+      );
 
       // Record success in Circuit Breaker state machine (recovers HALF_OPEN -> CLOSED)
       await circuitBreaker.recordSuccess(provider.name);

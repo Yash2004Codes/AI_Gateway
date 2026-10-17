@@ -10,6 +10,7 @@ import { createRedisConnection } from '../db/redis';
 import { getQueueMetrics } from '../queue/gateway.queue';
 import { query } from '../db/pool';
 import { logger } from '../utils/logger';
+import { verifyJwt } from '../middleware/auth.middleware';
 import Redis from 'ioredis';
 
 let io: SocketIOServer | null = null;
@@ -27,9 +28,15 @@ export function initializeSocketIO(httpServer: HttpServer): SocketIOServer {
   // ── Authentication middleware ──────────────────────
   io.use((socket, next) => {
     const token = socket.handshake.auth?.token;
-    // In production: verify JWT here
-    // For demo: allow all dashboard connections
-    next();
+    try {
+      const user = verifyJwt(token);
+      if (!['admin', 'operator'].includes(user.role)) {
+        return next(new Error('Insufficient permissions'));
+      }
+      next();
+    } catch {
+      next(new Error('Unauthorized'));
+    }
   });
 
   // ── Connection handler ─────────────────────────────

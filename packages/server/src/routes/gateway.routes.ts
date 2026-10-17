@@ -8,13 +8,12 @@ import { Router, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import { AuthenticatedRequest, apiKeyAuth } from '../middleware/auth.middleware';
 import { tenantRateLimiter, validateGatewayRequest } from '../middleware/ratelimit.middleware';
-import { getIdempotencyKey, setIdempotencyKey } from '../db/redis';
 import { query, queryOne } from '../db/pool';
 import { enqueueRequest } from '../queue/gateway.queue';
 import { idempotencyMiddleware } from '../middleware/idempotency.middleware';
+import { logger } from '../utils/logger';
 
 const router = Router();
-router.use(idempotencyMiddleware);
 
 // ─────────────────────────────────────────────
 // POST /api/v1/gateway/completions
@@ -23,6 +22,7 @@ router.use(idempotencyMiddleware);
 router.post(
   '/completions',
   apiKeyAuth,
+  idempotencyMiddleware,
   tenantRateLimiter,
   validateGatewayRequest,
   async (req: AuthenticatedRequest, res: Response): Promise<void> => {
@@ -33,28 +33,12 @@ router.post(
       requestedModel,
       maxTokens = 1024,
       temperature = 0.7,
-      idempotencyKey,
       callbackUrl,
       priority = 5,
     } = req.body;
 
-    // ── Idempotency Check ──────────────────────────────
-    if (idempotencyKey) {
-      const existing = await getIdempotencyKey(idempotencyKey);
-      if (existing) {
-        const existingRequest = JSON.parse(existing);
-        logger.info('Idempotent request - returning cached response', {
-          idempotencyKey,
-          requestId: existingRequest.requestId,
-        });
-        res.status(200).json({
-          ...existingRequest,
-          idempotent: true,
-          message: 'Returning cached response for idempotency key',
-        });
-        return;
-      }
-    }
+    // Idempotency key from header, if any
+    const idempotencyKey = req.headers['idempotency-key'] as string | undefined;
 
     // ── Create request record in PostgreSQL ────────────
     const requestId = uuidv4();
@@ -97,15 +81,6 @@ router.post(
       'UPDATE gateway_requests SET job_id = $1 WHERE id = $2',
       [job.id, requestId]
     );
-
-    // Cache idempotency key if provided
-    if (idempotencyKey) {
-      await setIdempotencyKey(
-        idempotencyKey,
-        JSON.stringify({ requestId, jobId: job.id, status: 'queued' }),
-        86400
-      );
-    }
 
     logger.info('Request accepted and queued', {
       requestId,

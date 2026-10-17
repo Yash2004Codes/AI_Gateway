@@ -1,8 +1,5 @@
-import { createClient } from 'redis';
-import { logger } from '../utils/logger';
-
-// Use ioredis for BullMQ, native redis for pub/sub
 import Redis from 'ioredis';
+import { logger } from '../utils/logger';
 
 let redisClient: Redis | null = null;
 
@@ -34,24 +31,6 @@ export async function closeRedis(): Promise<void> {
     redisClient = null;
     logger.info('Redis connection closed');
   }
-}
-
-/**
- * Idempotency cache: Store a key-value pair with expiry
- */
-export async function setIdempotencyKey(
-  key: string,
-  value: string,
-  ttlSeconds: number = 86400
-): Promise<void> {
-  await getRedis().setex(`idempotency:${key}`, ttlSeconds, value);
-}
-
-/**
- * Check if an idempotency key exists and return its value
- */
-export async function getIdempotencyKey(key: string): Promise<string | null> {
-  return getRedis().get(`idempotency:${key}`);
 }
 
 /**

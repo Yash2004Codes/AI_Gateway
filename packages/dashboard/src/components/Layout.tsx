@@ -90,7 +90,7 @@ export default function Layout({ children }: LayoutProps) {
               {user?.name?.charAt(0)?.toUpperCase() ?? 'A'}
             </div>
             <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--color-text-primary)', truncate: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap' }}>
+              <div style={{ fontSize: '0.8rem', fontWeight: 600, color: 'var(--color-text-primary)', textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap' }}>
                 {user?.name}
               </div>
               <div style={{ fontSize: '0.7rem', color: 'var(--color-text-muted)' }}>{user?.role}</div>
