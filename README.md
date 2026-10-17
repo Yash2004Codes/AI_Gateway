@@ -248,23 +248,37 @@ POST /api/v1/admin/auth/login
 
 ## 📊 Load Testing
 
+Requires [k6](https://grafana.com/docs/k6/latest/set-up/install-k6/) (`winget install GrafanaLabs.k6`,
+`brew install k6`). Both scripts log in as admin and create a throwaway `k6-*` tenant with very high
+limits, so they measure the gateway rather than the limiter.
+
 ```bash
-# Install k6: https://k6.io/docs/getting-started/installation/
+npm run test:load --workspace=packages/server    # ingestion benchmark (~2.5 min)
+npm run test:noisy --workspace=packages/server   # noisy-neighbour fairness (~40 s)
 
-# Run with default config (local)
-npm run test:load
-
-# Custom target
-k6 run --env GATEWAY_URL=http://localhost:3001 \
-        --env API_KEY=demo-api-key \
-        packages/server/tests/load/gateway-load-test.js
+# Other target / credentials
+k6 run --env GATEWAY_URL=http://host:3001 --env ADMIN_PASSWORD=... packages/server/tests/load/gateway-load-test.js
 ```
 
-**Test phases:**
-1. Ramp: 0→10 VUs over 30s
-2. Sustained: 50 VUs for 1 min
-3. Spike: 200 VUs — triggers rate limiting
-4. Cool down
+**`gateway-load-test.js`**: ramp 10 → 50 → spike 150 VUs → 50 → 0. Each iteration submits, polls status,
+and replays the same `Idempotency-Key`. A second scenario sends 5 req/s from Initech (limit 200 req/min)
+to check the limiter under load.
+
+**`noisy-neighbor-test.js`**: 20 VUs flood the queue from one tenant for 30 s while Acme sends 1 req/s
+and measures submit → `completed` time.
+
+Results on one laptop (Docker Compose stack, 2 workers × 5 concurrency, simulated vendors):
+
+| Test | Result |
+|------|--------|
+| `202 Accepted` latency, p95 (up to 150 VUs) | **9.45 ms** |
+| Requests accepted on the high-limit tenant | **3,455 / 3,455** |
+| Server errors (5xx) | **0 / 10,816** |
+| Idempotent replays served from cache | **100%** |
+| Over-limit requests answered `429` + `Retry-After` | **100 / 100** |
+| Initech admitted over 90 s at a 200 req/min limit | **350 / 450** (a fixed window would allow 400) |
+| Quiet tenant completion p95 during a 9.6k-job flood, **fair-share on** | **1.65 s** |
+| Same test, **FIFO** | **0 of 30** completed within 60 s |
 
 ---
 

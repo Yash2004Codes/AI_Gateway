@@ -11,7 +11,8 @@
     "start:worker": "node dist/worker.js",
     "test:load": "k6 run tests/load/gateway-load-test.js",
     "seed:demo": "tsx src/scripts/seedDemo.ts",
-    "test": "jest --runInBand"
+    "test": "jest --runInBand",
+    "test:noisy": "k6 run tests/load/noisy-neighbor-test.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.14.1",
