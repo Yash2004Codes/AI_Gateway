@@ -18,16 +18,22 @@
 ┌─────────────────────────────────────────────────────────────────────┐
 │              Express API Server (Node.js + Socket.io)               │
 │                                                                     │
-│  1. Authenticate tenant via API key → PostgreSQL                    │
-│  2. Check idempotency key → Redis (prevent duplicates)              │
-│  3. Pre-flight TPM check → Redis sliding window                     │
-│  4. Persist request → PostgreSQL gateway_requests                   │
-│  5. Enqueue job with TENANT GROUP KEY → BullMQ                      │
-│  6. Return HTTP 202 Accepted immediately                            │
+│  1. Authenticate: SHA-256(API key) → Redis cache → PostgreSQL       │
+│  2. Idempotency-Key header → Redis (tenant-scoped, 24h)             │
+│  3. Validate body                                                   │
+│  4. TPM + RPM check → Redis sliding window (atomic Lua)             │
+│  5. Persist request → PostgreSQL gateway_requests                   │
+│  6. Push job into the tenant's fair-share lane                      │
+│  7. Return HTTP 202 Accepted immediately                            │
 └────────────────────────────┬────────────────────────────────────────┘
                              │
-                      BullMQ Queue (Redis)
-                      [Fair-share: round-robin by tenant group key]
+          Per-tenant lanes (Redis ZSETs) + round-robin ring
+          ┌─────────┐ ┌─────────┐ ┌──────────────────┐
+          │ Acme  ▮ │ │Globex ▮ │ │Initech ▮▮▮▮▮▮▮▮▮ │
+          └────┬────┘ └────┬────┘ └────────┬─────────┘
+               └─ scheduler pops 1 job per tenant per turn ─┘
+                             │
+                 BullMQ queue (small buffer, Redis)
                              │
                   ┌──────────┴──────────┐
                   ▼                     ▼
@@ -40,14 +46,16 @@
          ┌───────────────────────────────────────┐
          │         Provider Dispatcher            │
          │  Priority → OpenAI → Anthropic → Gemini│
+         │  Distributed circuit breaker (Lua)     │
          │  Auto-failover on 429/5xx              │
-         │  SSRF protection on callbacks          │
+         │  SSRF-safe callback delivery           │
          └──────────────────┬────────────────────┘
                             │
               ┌─────────────┼─────────────┐
               ▼             ▼             ▼
           OpenAI       Anthropic       Gemini
-          GPT-4o       Claude-3.5   Gemini-1.5-Pro
+        gpt-5-mini  claude-haiku-5-5  gemini-2.5-flash
+     (each vendor runs live if its API key is set, simulated otherwise)
 
                             │ Results
                             ▼
@@ -167,32 +175,41 @@ graph TD
 ### Development Setup
 
 ```bash
-# 1. Clone and setup
-cd ai-gateway
+# 1. Create .env files (root + packages/server)
 node scripts/setup.js
 
-# 2. Edit .env with your API keys
-# OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY
-# No keys yet? Set LLM_MOCK_MODE=true to simulate vendor responses
-# (LLM_MOCK_FAILURE_RATE=0.3 exercises failover + circuit breaker)
-# Set the same values in packages/server/.env (the server reads its own cwd)
+# 2. Set JWT_SECRET, and DEMO_MODE=true to enable the Demo Control page.
+#    Vendor keys are optional: with LLM_MOCK_MODE=auto (default) each vendor
+#    whose key is missing is simulated, so the full pipeline still runs.
+#    Put the same values in packages/server/.env (the server reads its own cwd).
 
-# 3. Start Redis + PostgreSQL
-docker-compose up -d redis postgres
+# 3. Start Redis + PostgreSQL (schema + seed data load on first start)
+docker compose up -d redis postgres
 
-# 4. Install all dependencies
+# 4. Install dependencies and run API + worker + dashboard
 npm install
-
-# 5. Run everything in development
 npm run dev
+
+# 5. (Optional) 24h of request history for the charts
+npm run seed:demo --workspace=packages/server
 ```
 
-Open [http://localhost:3000](http://localhost:3000) — Login: `admin@gateway.local` / `admin123`
+Open [http://localhost:3000](http://localhost:3000) — Login: `admin@gateway.local` / `admin123`.
+Then open **Demo Control** — see [DEMO.md](DEMO.md) for a 5-minute walkthrough.
 
 ### Full Docker Deployment
 
 ```bash
-docker-compose up -d
+docker compose up -d --build
+```
+
+Dashboard on :3000, API on :3001, two worker replicas.
+
+### Tests
+
+```bash
+docker compose up -d redis                  # Lua-script tests run against real Redis (DB 15)
+npm test --workspace=packages/server        # Jest: limiter, fair queue, breaker, SSRF, idempotency
 ```
 
 ---
@@ -204,14 +221,15 @@ docker-compose up -d
 ```http
 POST /api/v1/gateway/completions
 X-Api-Key: your-tenant-api-key
+Idempotency-Key: unique-request-id-123
 Content-Type: application/json
 
 {
   "userMessage": "Explain quantum computing",
   "systemPrompt": "You are a helpful assistant.",
+  "requestedModel": "claude-sonnet-5-5",
   "maxTokens": 512,
   "priority": 5,
-  "idempotencyKey": "unique-request-id-123",
   "callbackUrl": "https://your-app.com/webhook"
 }
 ```
@@ -225,6 +243,23 @@ Content-Type: application/json
   "statusUrl": "/api/v1/gateway/requests/uuid-v4"
 }
 ```
+
+`Idempotency-Key`, `requestedModel`, `systemPrompt` and `callbackUrl` are optional. Without
+`requestedModel` each provider uses its default model. `priority` (1 = most urgent … 10) orders
+jobs *within* the tenant's lane.
+
+**Rate limited: HTTP 429** with `Retry-After`, `code` = `TPM_EXCEEDED` or `RPM_EXCEEDED`.
+Every response carries `X-RateLimit-{Limit,Remaining}-{Tokens,Requests}` headers.
+
+### How the core mechanisms work
+
+| Mechanism | Implementation |
+|-----------|----------------|
+| **Sliding-window limits** | Per tenant, two Redis hashes of 1-second buckets (tokens, requests). One Lua script sums the last 60s, checks TPM *and* RPM, and admits — atomic across API replicas, no fixed-window boundary burst, rejected requests aren't counted. Tokens are reserved up front (prompt/4 + maxTokens) and reconciled to actual usage when the job completes. |
+| **Fair-share round-robin** | Each tenant has its own lane (Redis ZSET, ordered by priority then arrival). A ring of active tenants is rotated by a Lua script that pops one job from the next tenant's lane. The scheduler keeps BullMQ's wait list to a small buffer, so ordering is decided by the round-robin, not arrival time. Can be switched to plain FIFO at runtime for comparison. |
+| **Circuit breaker** | Per provider, state in a Redis hash shared by all workers. CLOSED → OPEN after 3 consecutive failures; OPEN → HALF-OPEN after a 10s cooldown; HALF-OPEN admits a capped number of probes; 2 successes close it, any failure reopens it. Each transition is one Lua script. |
+| **Failover** | Providers are tried in priority order, one model per provider (requested model, else the provider's default). Breaker-OPEN providers are skipped. `providers_tried` is recorded on every request. |
+| **Chaos injection** | `PUT /api/v1/admin/chaos/:provider {"failureRate": 0..1}` makes that vendor fail with a simulated 503 for every worker, to demonstrate failover and the breaker on demand. |
 
 ### Poll Status
 
@@ -246,11 +281,12 @@ POST /api/v1/admin/auth/login
 
 | Threat | Mitigation |
 |--------|-----------|
-| **SSRF** | Callback URLs validated against allowlist of public domains; internal IPs/RFC-1918 blocked |
-| **Rate Exhaustion** | Per-tenant Redis sliding window TPM limiter; returns 429 with `Retry-After` |
-| **Noisy Neighbor** | BullMQ group keys per tenant enforce fair round-robin processing |
-| **Replay Attacks** | Redis idempotency cache (24h TTL) deduplicates identical requests |
-| **Auth Bypass** | API key + JWT with role-based access control (admin/operator/viewer) |
+| **SSRF** | Callback URLs are DNS-resolved; every resolved IP is checked against private, loopback, link-local/metadata and IPv4-mapped IPv6 ranges; the connection is pinned to the validated IP (with TLS SNI); redirects are refused |
+| **Rate Exhaustion** | Per-tenant sliding-window TPM + RPM limiter (atomic Lua); 429 with `Retry-After` |
+| **Noisy Neighbor** | Per-tenant fair-share lanes, round-robin scheduling into the worker queue |
+| **Replay / duplicates** | `Idempotency-Key` header, tenant-scoped, atomic `SET NX`; concurrent duplicates get 409, completed ones replay the cached response |
+| **Key theft from DB** | API keys stored only as SHA-256 hashes (+ display prefix); raw key shown once at creation |
+| **Auth Bypass** | API keys for the gateway; JWT + RBAC (admin/operator/viewer) for admin API and WebSocket |
 
 ---
 
@@ -296,9 +332,12 @@ k6 run --env GATEWAY_URL=http://localhost:3001 \
 | Issue | Planned Fix |
 |-------|------------|
 | Postgres metric writes at scale | Migrate hot metrics to ClickHouse/InfluxDB append-only |
-| Single Redis instance | Redis Sentinel/Cluster for HA |
+| Single Redis instance; fair-share Lua scripts build keys dynamically (not Redis Cluster-safe) | Redis Sentinel; hash-tag lane keys for Cluster |
+| A job popped from a lane is lost if the scheduler crashes before handing it to BullMQ (request row stays `queued`) | Move lane → BullMQ inside one Lua script, or a reaper for stale `queued` rows |
+| Token ledger is batched in memory (500ms) before insert | Write-ahead to a Redis stream for durability |
+| Token reservation estimate is chars/4 | Use the vendor tokenizer |
+| No streaming responses | SSE endpoint for chat use-cases |
 | No prompt caching | Semantic cache (Redis + embeddings) for identical prompts |
-| Manual health checks | Active health probes with circuit breaker pattern |
 
 ---
 
@@ -310,21 +349,23 @@ ai-gateway/
 │   ├── server/              # Node.js API + BullMQ workers
 │   │   ├── src/
 │   │   │   ├── db/          # PostgreSQL pool + Redis client
-│   │   │   ├── middleware/  # Auth, rate limiting
-│   │   │   ├── providers/   # OpenAI/Anthropic/Gemini adapters
-│   │   │   ├── queue/       # BullMQ queue + worker
+│   │   │   ├── demo/        # Traffic generator, history seeder
+│   │   │   ├── middleware/  # Auth, idempotency, rate limiting
+│   │   │   ├── providers/   # Vendor classes + failover dispatcher
+│   │   │   ├── queue/       # Fair-share lanes, BullMQ queue + worker
 │   │   │   ├── routes/      # Express routes
+│   │   │   ├── services/    # Live control-plane snapshot
 │   │   │   ├── socket/      # Socket.io server
-│   │   │   ├── utils/       # Logger
+│   │   │   ├── utils/       # Limiter, circuit breaker, chaos, SSRF, API keys
 │   │   │   ├── index.ts     # API server entry
 │   │   │   └── worker.ts    # Worker entry
-│   │   └── tests/load/      # k6 load tests
+│   │   └── tests/           # Jest unit tests + k6 load tests
 │   └── dashboard/           # React admin dashboard
 │       └── src/
 │           ├── api/         # Axios client
 │           ├── components/  # Layout
 │           ├── contexts/    # Auth + Socket contexts
-│           └── pages/       # Dashboard, Requests, Providers, Tenants, Playground
+│           └── pages/       # Dashboard, Requests, Providers, Tenants, Playground, Demo
 ├── docker-compose.yml
 ├── .env.example
 └── scripts/setup.js

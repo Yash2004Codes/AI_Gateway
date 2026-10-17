@@ -34,28 +34,6 @@ export async function closeRedis(): Promise<void> {
 }
 
 /**
- * Tenant TPM rate limiting using sliding window
- */
-export async function checkTpmLimit(
-  tenantId: string,
-  tokens: number,
-  limit: number
-): Promise<{ allowed: boolean; current: number; limit: number }> {
-  const redis = getRedis();
-  const key = `tpm:${tenantId}:${Math.floor(Date.now() / 60000)}`;
-
-  const pipeline = redis.pipeline();
-  pipeline.incrby(key, tokens);
-  pipeline.expire(key, 120); // 2 minute window
-  const results = await pipeline.exec();
-
-  const current = (results?.[0]?.[1] as number) || 0;
-  const allowed = current <= limit;
-
-  return { allowed, current, limit };
-}
-
-/**
  * Publish a provider health event for real-time UI updates
  */
 export async function publishProviderHealth(data: Record<string, unknown>): Promise<void> {

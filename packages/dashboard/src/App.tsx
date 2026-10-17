@@ -8,6 +8,7 @@ import RequestsPage from './pages/RequestsPage';
 import ProvidersPage from './pages/ProvidersPage';
 import TenantsPage from './pages/TenantsPage';
 import PlaygroundPage from './pages/PlaygroundPage';
+import DemoPage from './pages/DemoPage';
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { user, loading } = useAuth();
@@ -39,6 +40,7 @@ function AppRoutes() {
                   <Route path="/providers" element={<ProvidersPage />} />
                   <Route path="/tenants" element={<TenantsPage />} />
                   <Route path="/playground" element={<PlaygroundPage />} />
+                  <Route path="/demo" element={<DemoPage />} />
                   <Route path="*" element={<Navigate to="/" replace />} />
                 </Routes>
               </Layout>

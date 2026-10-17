@@ -55,7 +55,10 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       GEMINI_API_KEY: ${GEMINI_API_KEY}
-      LLM_MOCK_MODE: ${LLM_MOCK_MODE:-false}
+      LLM_MOCK_MODE: ${LLM_MOCK_MODE:-auto}
+      FAIR_SHARE_BUFFER: ${FAIR_SHARE_BUFFER:-5}
+      CIRCUIT_BREAKER_COOLDOWN_MS: ${CIRCUIT_BREAKER_COOLDOWN_MS:-10000}
+      DEMO_MODE: ${DEMO_MODE:-false}
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set in .env}
     ports:
       - "3001:3001"
@@ -81,7 +84,10 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       GEMINI_API_KEY: ${GEMINI_API_KEY}
-      LLM_MOCK_MODE: ${LLM_MOCK_MODE:-false}
+      LLM_MOCK_MODE: ${LLM_MOCK_MODE:-auto}
+      FAIR_SHARE_BUFFER: ${FAIR_SHARE_BUFFER:-5}
+      CIRCUIT_BREAKER_COOLDOWN_MS: ${CIRCUIT_BREAKER_COOLDOWN_MS:-10000}
+      DEMO_MODE: ${DEMO_MODE:-false}
     depends_on:
       redis:
         condition: service_healthy

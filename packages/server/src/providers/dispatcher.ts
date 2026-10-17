@@ -9,6 +9,7 @@ import { logger } from '../utils/logger';
 import { query, queryOne } from '../db/pool';
 import { publishProviderHealth } from '../db/redis';
 import { circuitBreaker } from '../utils/redisCircuitBreaker';
+import { applyChaos } from '../utils/chaos';
 
 export interface LLMRequest {
   systemPrompt?: string;
@@ -97,41 +98,6 @@ async function recordHealthEvent(
 }
 
 // ─────────────────────────────────────────────
-// SSRF Protection: validate provider URLs
-// Restrict to known public domains only
-// ─────────────────────────────────────────────
-const ALLOWED_PROVIDER_DOMAINS = [
-  'api.openai.com',
-  'api.anthropic.com',
-  'generativelanguage.googleapis.com',
-  'bedrock-runtime.amazonaws.com',
-];
-
-export function isAllowedProviderUrl(url: string): boolean {
-  try {
-    const parsed = new URL(url);
-    // Block private/internal IP ranges (SSRF protection)
-    const hostname = parsed.hostname;
-    if (
-      hostname === 'localhost' ||
-      hostname === '127.0.0.1' ||
-      hostname.startsWith('10.') ||
-      hostname.startsWith('172.16.') ||
-      hostname.startsWith('192.168.') ||
-      hostname === '0.0.0.0' ||
-      hostname === '::1' ||
-      hostname.endsWith('.internal') ||
-      hostname.endsWith('.local')
-    ) {
-      return false;
-    }
-    return ALLOWED_PROVIDER_DOMAINS.some((d) => hostname === d || hostname.endsWith('.' + d));
-  } catch {
-    return false;
-  }
-}
-
-// ─────────────────────────────────────────────
 // Main Dispatcher: Try providers in priority order
 // ─────────────────────────────────────────────
 export async function dispatchToProvider(
@@ -139,55 +105,67 @@ export async function dispatchToProvider(
   request: LLMRequest,
   tenantId: string
 ): Promise<LLMResponse & { providersTried: string[] }> {
-  // Get ordered provider fallback chain
+  // One model per provider: the requested model if this provider serves it,
+  // otherwise the provider's default (first-registered active model).
+  // Failover therefore moves to a *different vendor* rather than retrying
+  // the same vendor with another model.
   const providers = await query<{
     name: string;
-    health_status: string;
     priority: number;
     model_name: string;
+    input_cost: string;
+    output_cost: string;
   }>(
-    `SELECT p.name, p.health_status, p.priority, m.name AS model_name
+    `SELECT DISTINCT ON (p.name)
+            p.name, p.priority, m.name AS model_name,
+            m.input_cost_per_1k_tokens AS input_cost,
+            m.output_cost_per_1k_tokens AS output_cost
      FROM providers p
      JOIN models m ON m.provider_id = p.id
      WHERE p.is_active = true AND m.is_active = true
-     ORDER BY p.priority ASC, p.avg_latency_ms ASC`
+     ORDER BY p.name, (m.name = $1) DESC, m.is_default DESC, m.name ASC`,
+    [requestedModel ?? null]
   );
 
   if (providers.length === 0) {
     throw new Error('No active providers configured');
   }
 
-  // If a specific model is requested, prefer its provider first
-  let orderedProviders = [...providers];
-  if (requestedModel) {
-    orderedProviders = [
-      ...providers.filter((p) => p.model_name === requestedModel),
-      ...providers.filter((p) => p.model_name !== requestedModel),
-    ];
-  }
+  // Priority order; the provider that owns the requested model goes first
+  const orderedProviders = providers.sort((a, b) => {
+    if (requestedModel) {
+      if (a.model_name === requestedModel && b.model_name !== requestedModel) return -1;
+      if (b.model_name === requestedModel && a.model_name !== requestedModel) return 1;
+    }
+    return a.priority - b.priority;
+  });
 
   const providersTried: string[] = [];
   let lastError: Error | null = null;
 
   for (const provider of orderedProviders) {
-    // Check Redis-backed Circuit Breaker state (CLOSED, OPEN, HALF_OPEN)
+    // The circuit breaker owns the skip decision. (Skipping on the DB
+    // health_status would never let a 'down' provider recover, since no
+    // new health events would be recorded for it.)
     const canExecute = await circuitBreaker.canExecute(provider.name);
-    if (!canExecute || provider.health_status === 'down') {
-      logger.warn(`Skipping provider ${provider.name} - Circuit Breaker OPEN or HALF_OPEN limit reached`);
+    if (!canExecute) {
+      logger.warn(`Skipping provider ${provider.name} - circuit breaker OPEN`);
       continue;
     }
 
-    const providerKey = `${provider.name}/${provider.model_name}`;
-    if (providersTried.includes(providerKey)) continue;
-    providersTried.push(providerKey);
+    providersTried.push(`${provider.name}/${provider.model_name}`);
 
     try {
       logger.info(`Attempting provider ${provider.name} with model ${provider.model_name}`);
 
+      // Fault injection (demo / resilience testing) happens before the vendor call
+      await applyChaos(provider.name);
+
       // Polymorphism: every provider exposes the same complete() method
       const result: LLMResponse = await getProvider(provider.name).complete(
         provider.model_name,
-        request
+        request,
+        { inputPer1k: Number(provider.input_cost), outputPer1k: Number(provider.output_cost) }
       );
 
       // Record success in Circuit Breaker state machine (recovers HALF_OPEN -> CLOSED)
@@ -197,6 +175,7 @@ export async function dispatchToProvider(
         model: result.model,
         latencyMs: result.latencyMs,
         tokens: result.totalTokens,
+        tenantId,
       });
 
       return { ...result, providersTried };
@@ -221,6 +200,8 @@ export async function dispatchToProvider(
   }
 
   throw new Error(
-    `All providers failed. Tried: ${providersTried.join(', ')}. Last error: ${lastError?.message}`
+    providersTried.length === 0
+      ? 'All providers unavailable (circuit breakers open)'
+      : `All providers failed. Tried: ${providersTried.join(', ')}. Last error: ${lastError?.message}`
   );
 }

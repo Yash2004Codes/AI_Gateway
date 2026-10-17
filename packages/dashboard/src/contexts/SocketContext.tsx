@@ -10,6 +10,7 @@ interface ProviderHealth {
 }
 
 interface QueueMetrics {
+  lanes: number;
   waiting: number;
   active: number;
   completed: number;
@@ -18,8 +19,10 @@ interface QueueMetrics {
 }
 
 interface JobUpdate {
-  requestId: string;
+  requestId: string | null;
   tenantId: string;
+  tenantName?: string;
+  providersTried?: string[];
   status: string;
   provider?: string;
   model?: string;
@@ -42,7 +45,39 @@ interface RecentRequest {
   tenant_name: string;
 }
 
+export interface ProviderControl {
+  name: string;
+  mode: 'live' | 'mock';
+  breaker: { state: 'CLOSED' | 'OPEN' | 'HALF_OPEN'; consecutiveFailures: number; openedAt?: string; lastError?: string };
+  chaos: { failureRate: number; latencyMs: number };
+}
+
+export interface TenantLive {
+  id: string;
+  name: string;
+  tpmLimit: number;
+  rpmLimit: number;
+  tpmUsed: number;
+  rpmUsed: number;
+  rejectedLastMinute: number;
+  laneDepth: number;
+  inFlight: number;
+  completedRecent: number;
+  avgWaitMs: number | null;
+  p95WaitMs: number | null;
+}
+
+export interface TrafficStatus {
+  steady: boolean;
+  burst: boolean;
+  tenants: Record<string, { name: string; sent: number; accepted: number; rateLimited: number; errors: number }>;
+}
+
 interface SocketContextValue {
+  controls: ProviderControl[];
+  tenants: TenantLive[];
+  fairShare: boolean;
+  traffic: TrafficStatus | null;
   connected: boolean;
   providers: ProviderHealth[];
   queueMetrics: QueueMetrics;
@@ -51,9 +86,13 @@ interface SocketContextValue {
   subscribeToTenant: (tenantId: string) => void;
 }
 
-const defaultQueue: QueueMetrics = { waiting: 0, active: 0, completed: 0, failed: 0, delayed: 0 };
+const defaultQueue: QueueMetrics = { lanes: 0, waiting: 0, active: 0, completed: 0, failed: 0, delayed: 0 };
 
 const SocketContext = createContext<SocketContextValue>({
+  controls: [],
+  tenants: [],
+  fairShare: true,
+  traffic: null,
   connected: false,
   providers: [],
   queueMetrics: defaultQueue,
@@ -69,6 +108,10 @@ export function SocketProvider({ children }: { children: ReactNode }) {
   const [queueMetrics, setQueueMetrics] = useState<QueueMetrics>(defaultQueue);
   const [recentRequests, setRecentRequests] = useState<RecentRequest[]>([]);
   const [liveEvents, setLiveEvents] = useState<JobUpdate[]>([]);
+  const [controls, setControls] = useState<ProviderControl[]>([]);
+  const [tenants, setTenants] = useState<TenantLive[]>([]);
+  const [fairShare, setFairShare] = useState(true);
+  const [traffic, setTraffic] = useState<TrafficStatus | null>(null);
 
   useEffect(() => {
     const token = localStorage.getItem('gateway_token');
@@ -94,10 +137,18 @@ export function SocketProvider({ children }: { children: ReactNode }) {
       );
     });
 
-    sock.on('metrics:update', (data: { queue: QueueMetrics; providers: ProviderHealth[] }) => {
+    sock.on('metrics:update', (data: {
+      queue: QueueMetrics; providers: ProviderHealth[];
+      controls: ProviderControl[]; tenants: TenantLive[]; fairShare: boolean;
+    }) => {
       if (data.queue) setQueueMetrics(data.queue);
       if (data.providers) setProviders(data.providers);
+      if (data.controls) setControls(data.controls);
+      if (data.tenants) setTenants(data.tenants);
+      if (typeof data.fairShare === 'boolean') setFairShare(data.fairShare);
     });
+
+    sock.on('demo:traffic', (data: TrafficStatus) => setTraffic(data));
 
     sock.on('job:update', (data: JobUpdate) => {
       setLiveEvents((prev) => [data, ...prev].slice(0, 100));
@@ -128,7 +179,7 @@ export function SocketProvider({ children }: { children: ReactNode }) {
   );
 
   return (
-    <SocketContext.Provider value={{ connected, providers, queueMetrics, recentRequests, liveEvents, subscribeToTenant }}>
+    <SocketContext.Provider value={{ controls, tenants, fairShare, traffic, connected, providers, queueMetrics, recentRequests, liveEvents, subscribeToTenant }}>
       {children}
     </SocketContext.Provider>
   );

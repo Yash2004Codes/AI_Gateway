@@ -25,7 +25,88 @@ export interface CircuitBreakerStatus {
   lastStateChange: string;
   openedAt?: string;
   halfOpenTrials: number;
+  lastError?: string;
 }
+
+// ─────────────────────────────────────────────
+// Every transition is a single Lua script: state is shared by all workers,
+// and read-then-write in application code would let two workers race
+// (e.g. both admitted as the "only" HALF_OPEN probe).
+// Each script returns { allowedOrIgnored, newState, transitioned }.
+// ─────────────────────────────────────────────
+
+const CAN_EXECUTE = `
+local k = KEYS[1]
+local now = tonumber(ARGV[1])
+local cooldown = tonumber(ARGV[2])
+local maxTrials = tonumber(ARGV[3])
+local state = redis.call('HGET', k, 'state') or 'CLOSED'
+
+if state == 'CLOSED' then return {1, state, 0} end
+
+if state == 'OPEN' then
+  local openedAt = tonumber(redis.call('HGET', k, 'opened_at') or '0')
+  if now - openedAt >= cooldown then
+    redis.call('HSET', k, 'state', 'HALF_OPEN', 'half_open_trials', 1,
+      'consecutive_successes', 0, 'last_state_change', now)
+    return {1, 'HALF_OPEN', 1}
+  end
+  return {0, state, 0}
+end
+
+local trials = tonumber(redis.call('HGET', k, 'half_open_trials') or '0')
+if trials < maxTrials then
+  redis.call('HINCRBY', k, 'half_open_trials', 1)
+  return {1, state, 0}
+end
+return {0, state, 0}
+`;
+
+const RECORD_SUCCESS = `
+local k = KEYS[1]
+local now = tonumber(ARGV[1])
+local needed = tonumber(ARGV[2])
+local state = redis.call('HGET', k, 'state') or 'CLOSED'
+
+if state == 'HALF_OPEN' then
+  local s = redis.call('HINCRBY', k, 'consecutive_successes', 1)
+  if s >= needed then
+    redis.call('HSET', k, 'state', 'CLOSED', 'consecutive_failures', 0,
+      'consecutive_successes', 0, 'half_open_trials', 0, 'last_state_change', now)
+    return {1, 'CLOSED', 1}
+  end
+  return {1, state, 0}
+end
+
+if state == 'CLOSED' then
+  redis.call('HSET', k, 'consecutive_failures', 0)
+end
+return {1, state, 0}
+`;
+
+const RECORD_FAILURE = `
+local k = KEYS[1]
+local now = tonumber(ARGV[1])
+local threshold = tonumber(ARGV[2])
+local reason = ARGV[3]
+local state = redis.call('HGET', k, 'state') or 'CLOSED'
+
+if state == 'HALF_OPEN' then
+  redis.call('HSET', k, 'state', 'OPEN', 'opened_at', now, 'consecutive_successes', 0,
+    'half_open_trials', 0, 'last_state_change', now, 'last_error', reason)
+  return {1, 'OPEN', 1}
+end
+
+if state == 'CLOSED' then
+  local f = redis.call('HINCRBY', k, 'consecutive_failures', 1)
+  redis.call('HSET', k, 'last_error', reason)
+  if f >= threshold then
+    redis.call('HSET', k, 'state', 'OPEN', 'opened_at', now, 'last_state_change', now)
+    return {1, 'OPEN', 1}
+  end
+end
+return {1, state, 0}
+`;
 
 export class RedisCircuitBreaker {
   private config: CircuitBreakerConfig;
@@ -43,88 +124,35 @@ export class RedisCircuitBreaker {
    * Atomically transitions state from OPEN -> HALF_OPEN when cooldown expires.
    */
   async canExecute(provider: string): Promise<boolean> {
-    const redis = getRedis();
-    const key = this.getKey(provider);
+    const [allowed, , transitioned] = (await getRedis().eval(
+      CAN_EXECUTE,
+      1,
+      this.getKey(provider),
+      Date.now(),
+      this.config.cooldownMs,
+      this.config.halfOpenMaxTrials
+    )) as [number, CircuitState, number];
 
-    const now = Date.now();
-    const data = await redis.hgetall(key);
-
-    const state = (data.state as CircuitState) || 'CLOSED';
-    const openedAt = data.opened_at ? parseInt(data.opened_at, 10) : 0;
-    const halfOpenTrials = data.half_open_trials ? parseInt(data.half_open_trials, 10) : 0;
-
-    if (state === 'CLOSED') {
-      return true;
+    if (transitioned) {
+      logger.info(`CircuitBreaker [${provider}]: OPEN cooldown expired. Transitioning to HALF_OPEN (probing)`);
     }
-
-    if (state === 'OPEN') {
-      // Check if cooldown timer has passed
-      if (now - openedAt >= this.config.cooldownMs) {
-        // Atomic transition to HALF_OPEN
-        await redis
-          .multi()
-          .hset(key, {
-            state: 'HALF_OPEN',
-            half_open_trials: '1',
-            consecutive_successes: '0',
-            last_state_change: now.toString(),
-          })
-          .exec();
-
-        logger.info(`CircuitBreaker [${provider}]: OPEN cooldown expired. Transitioning to HALF_OPEN (Trial 1)`);
-        return true;
-      }
-
-      // Still in cooldown period - fast fail!
-      return false;
-    }
-
-    if (state === 'HALF_OPEN') {
-      if (halfOpenTrials < this.config.halfOpenMaxTrials) {
-        await redis.hincrby(key, 'half_open_trials', 1);
-        logger.info(`CircuitBreaker [${provider}]: Allowed probe trial ${halfOpenTrials + 1}/${this.config.halfOpenMaxTrials} in HALF_OPEN state`);
-        return true;
-      }
-      return false;
-    }
-
-    return true;
+    return allowed === 1;
   }
 
   /**
    * Records a successful request for a provider.
    */
   async recordSuccess(provider: string): Promise<void> {
-    const redis = getRedis();
-    const key = this.getKey(provider);
-    const now = Date.now();
+    const [, , transitioned] = (await getRedis().eval(
+      RECORD_SUCCESS,
+      1,
+      this.getKey(provider),
+      Date.now(),
+      this.config.halfOpenSuccessThreshold
+    )) as [number, CircuitState, number];
 
-    const data = await redis.hgetall(key);
-    const state = (data.state as CircuitState) || 'CLOSED';
-
-    if (state === 'HALF_OPEN') {
-      const currentSuccesses = (data.consecutive_successes ? parseInt(data.consecutive_successes, 10) : 0) + 1;
-
-      if (currentSuccesses >= this.config.halfOpenSuccessThreshold) {
-        // Circuit recovered! Transition to CLOSED
-        await redis
-          .multi()
-          .hset(key, {
-            state: 'CLOSED',
-            consecutive_failures: '0',
-            consecutive_successes: '0',
-            half_open_trials: '0',
-            last_state_change: now.toString(),
-          })
-          .exec();
-
-        logger.info(`CircuitBreaker [${provider}]: Probe successful! State recovered: HALF_OPEN -> CLOSED`);
-      } else {
-        await redis.hset(key, 'consecutive_successes', currentSuccesses.toString());
-      }
-    } else if (state === 'CLOSED') {
-      // Reset failure counter on success
-      await redis.hset(key, 'consecutive_failures', '0');
+    if (transitioned) {
+      logger.info(`CircuitBreaker [${provider}]: Probe successful! State recovered: HALF_OPEN -> CLOSED`);
     }
   }
 
@@ -132,48 +160,17 @@ export class RedisCircuitBreaker {
    * Records a failure for a provider.
    */
   async recordFailure(provider: string, errorReason?: string): Promise<void> {
-    const redis = getRedis();
-    const key = this.getKey(provider);
-    const now = Date.now();
+    const [, state, transitioned] = (await getRedis().eval(
+      RECORD_FAILURE,
+      1,
+      this.getKey(provider),
+      Date.now(),
+      this.config.failureThreshold,
+      errorReason ?? 'Request failed'
+    )) as [number, CircuitState, number];
 
-    const data = await redis.hgetall(key);
-    const state = (data.state as CircuitState) || 'CLOSED';
-
-    if (state === 'HALF_OPEN') {
-      // Probe failed! Immediately trip back to OPEN
-      await redis
-        .multi()
-        .hset(key, {
-          state: 'OPEN',
-          opened_at: now.toString(),
-          consecutive_successes: '0',
-          half_open_trials: '0',
-          last_state_change: now.toString(),
-          last_error: errorReason ?? 'Probe trial failed',
-        })
-        .exec();
-
-      logger.warn(`CircuitBreaker [${provider}]: Probe failed! Transitioning: HALF_OPEN -> OPEN (cooldown restarted)`);
-    } else if (state === 'CLOSED') {
-      const currentFailures = (data.consecutive_failures ? parseInt(data.consecutive_failures, 10) : 0) + 1;
-
-      if (currentFailures >= this.config.failureThreshold) {
-        // Threshold breached! Trip circuit to OPEN
-        await redis
-          .multi()
-          .hset(key, {
-            state: 'OPEN',
-            opened_at: now.toString(),
-            consecutive_failures: currentFailures.toString(),
-            last_state_change: now.toString(),
-            last_error: errorReason ?? 'Failure threshold exceeded',
-          })
-          .exec();
-
-        logger.warn(`CircuitBreaker [${provider}]: Failure threshold (${currentFailures}/${this.config.failureThreshold}) reached! State tripped: CLOSED -> OPEN`);
-      } else {
-        await redis.hset(key, 'consecutive_failures', currentFailures.toString());
-      }
+    if (transitioned && state === 'OPEN') {
+      logger.warn(`CircuitBreaker [${provider}]: tripped to OPEN (cooldown ${this.config.cooldownMs}ms)`);
     }
   }
 
@@ -181,29 +178,20 @@ export class RedisCircuitBreaker {
    * Fetches status of circuit breaker for a provider across all replicas.
    */
   async getStatus(provider: string): Promise<CircuitBreakerStatus> {
-    const redis = getRedis();
-    const key = this.getKey(provider);
-    const data = await redis.hgetall(key);
+    const data = await getRedis().hgetall(this.getKey(provider));
 
     const state = (data.state as CircuitState) || 'CLOSED';
-    const failures = data.consecutive_failures ? parseInt(data.consecutive_failures, 10) : 0;
-    const successes = data.consecutive_successes ? parseInt(data.consecutive_successes, 10) : 0;
-    const trials = data.half_open_trials ? parseInt(data.half_open_trials, 10) : 0;
-    const lastChange = data.last_state_change
-      ? new Date(parseInt(data.last_state_change, 10)).toISOString()
-      : new Date().toISOString();
-    const openedAt = data.opened_at
-      ? new Date(parseInt(data.opened_at, 10)).toISOString()
-      : undefined;
-
     return {
       provider,
       state,
-      consecutiveFailures: failures,
-      consecutiveSuccesses: successes,
-      lastStateChange: lastChange,
-      openedAt,
-      halfOpenTrials: trials,
+      consecutiveFailures: data.consecutive_failures ? parseInt(data.consecutive_failures, 10) : 0,
+      consecutiveSuccesses: data.consecutive_successes ? parseInt(data.consecutive_successes, 10) : 0,
+      lastStateChange: data.last_state_change
+        ? new Date(parseInt(data.last_state_change, 10)).toISOString()
+        : new Date().toISOString(),
+      openedAt: data.opened_at ? new Date(parseInt(data.opened_at, 10)).toISOString() : undefined,
+      halfOpenTrials: data.half_open_trials ? parseInt(data.half_open_trials, 10) : 0,
+      lastError: data.last_error,
     };
   }
 
@@ -211,22 +199,18 @@ export class RedisCircuitBreaker {
    * Force reset circuit breaker state to CLOSED (Admin override)
    */
   async reset(provider: string): Promise<void> {
-    const redis = getRedis();
-    const key = this.getKey(provider);
-
-    await redis
-      .multi()
-      .hset(key, {
-        state: 'CLOSED',
-        consecutive_failures: '0',
-        consecutive_successes: '0',
-        half_open_trials: '0',
-        last_state_change: Date.now().toString(),
-      })
-      .exec();
+    await getRedis().hset(this.getKey(provider), {
+      state: 'CLOSED',
+      consecutive_failures: '0',
+      consecutive_successes: '0',
+      half_open_trials: '0',
+      last_state_change: Date.now().toString(),
+    });
 
     logger.info(`CircuitBreaker [${provider}]: Manually reset to CLOSED`);
   }
 }
 
-export const circuitBreaker = new RedisCircuitBreaker();
+export const circuitBreaker = new RedisCircuitBreaker({
+  cooldownMs: Number(process.env.CIRCUIT_BREAKER_COOLDOWN_MS) || DEFAULT_CONFIG.cooldownMs,
+});

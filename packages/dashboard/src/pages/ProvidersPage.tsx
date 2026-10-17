@@ -6,6 +6,7 @@ interface Provider {
   id: string; name: string; display_name: string; is_active: boolean;
   priority: number; health_status: string; error_rate: number;
   avg_latency_ms: number; last_health_check: string | null; model_count: number;
+  mode: 'live' | 'mock';
 }
 
 interface Model {
@@ -88,7 +89,12 @@ export default function ProvidersPage() {
                   </div>
                   <div>
                     <div style={{ fontWeight: 700, fontSize: '0.95rem' }}>{p.display_name}</div>
-                    <div style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)' }}>Priority {p.priority} · {p.model_count} models</div>
+                    <div style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)' }}>
+                      Priority {p.priority} · {p.model_count} models ·{' '}
+                      <span style={{ color: p.mode === 'live' ? 'var(--color-info)' : 'var(--color-text-muted)' }}>
+                        {p.mode === 'live' ? 'live API' : 'mock (no API key)'}
+                      </span>
+                    </div>
                   </div>
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
@@ -162,10 +168,10 @@ export default function ProvidersPage() {
         <h3 style={{ marginBottom: '0.75rem', color: 'var(--color-primary-light)' }}>⚡ Failover Routing Logic</h3>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem', fontSize: '0.875rem', color: 'var(--color-text-secondary)' }}>
           {[
-            { icon: '1️⃣', title: 'Priority-Based Selection', desc: 'Requests are routed to the highest-priority active provider. Lower priority number = preferred.' },
+            { icon: '1️⃣', title: 'Priority-Based Selection', desc: 'Each request tries active providers in priority order (lower = preferred), using each provider’s default model unless a model is requested.' },
             { icon: '⚡', title: 'Automatic Failover', desc: 'On 429 (Rate Limit) or 5xx errors, the gateway instantly falls back to the next provider in the chain.' },
-            { icon: '🩺', title: 'Health-Based Routing', desc: 'Providers marked as "down" are skipped entirely. Degraded providers are deprioritized.' },
-            { icon: '🛡️', title: 'SSRF Protection', desc: 'All outbound callback URLs are validated against an allowlist of public domains. Internal IPs are blocked.' },
+            { icon: '🩺', title: 'Distributed Circuit Breaker', desc: 'After 3 consecutive failures a provider is skipped (OPEN) for 10s, then probed (HALF-OPEN); 2 successful probes close it. State is shared by all workers via Redis.' },
+            { icon: '🛡️', title: 'SSRF Protection', desc: 'Callback URLs are DNS-resolved, every IP is checked against private/metadata ranges, the connection is pinned to the validated IP, and redirects are refused.' },
           ].map((item) => (
             <div key={item.title} style={{ display: 'flex', gap: '0.75rem' }}>
               <span style={{ fontSize: '1.1rem', flexShrink: 0 }}>{item.icon}</span>

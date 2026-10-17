@@ -8,6 +8,7 @@ const NAV_ITEMS = [
     items: [
       { path: '/', label: 'Flight Radar', icon: <RadarIcon /> },
       { path: '/requests', label: 'Request Ledger', icon: <ListIcon /> },
+      { path: '/demo', label: 'Demo Control', icon: <BoltIcon /> },
     ],
   },
   {
@@ -151,4 +152,7 @@ function UsersIcon() {
 }
 function PlayIcon() {
   return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>;
+}
+function BoltIcon() {
+  return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>;
 }

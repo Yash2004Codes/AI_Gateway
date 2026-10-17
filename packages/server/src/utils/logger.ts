@@ -7,6 +7,7 @@ const isProduction = process.env.NODE_ENV === 'production';
 
 export const logger = winston.createLogger({
   level: isProduction ? 'info' : 'debug',
+  silent: process.env.NODE_ENV === 'test',
   format: combine(
     timestamp({ format: 'YYYY-MM-DD HH:mm:ss.SSS' }),
     errors({ stack: true }),

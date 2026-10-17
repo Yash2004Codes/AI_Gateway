@@ -10,37 +10,35 @@ import Anthropic from '@anthropic-ai/sdk';
 import axios from 'axios';
 import type { LLMRequest, LLMResponse } from './dispatcher';
 
+// Per-1K-token prices, read from the models table by the dispatcher
+export interface ModelPricing {
+  inputPer1k: number;
+  outputPer1k: number;
+}
+
 // ─────────────────────────────────────────────
 // Contract every provider must follow
 // ─────────────────────────────────────────────
 export interface LLMProvider {
   readonly name: string;
-  complete(model: string, request: LLMRequest): Promise<LLMResponse>;
+  readonly mode: 'live' | 'mock';
+  complete(model: string, request: LLMRequest, pricing: ModelPricing): Promise<LLMResponse>;
 }
+
+type RawResult = { responseText: string; promptTokens: number; completionTokens: number };
 
 // ─────────────────────────────────────────────
 // Abstract base: shared logic (timing + cost) lives in ONE place
 // ─────────────────────────────────────────────
-const MODEL_COSTS: Record<string, { input: number; output: number }> = {
-  'gpt-4o': { input: 0.005, output: 0.015 },
-  'gpt-4o-mini': { input: 0.00015, output: 0.0006 },
-  'gpt-3.5-turbo': { input: 0.0005, output: 0.0015 },
-  'claude-3-5-sonnet-20241022': { input: 0.003, output: 0.015 },
-  'claude-3-haiku-20240307': { input: 0.00025, output: 0.00125 },
-  'gemini-1.5-pro': { input: 0.00125, output: 0.005 },
-  'gemini-1.5-flash': { input: 0.000075, output: 0.0003 },
-};
-
-type RawResult = { responseText: string; promptTokens: number; completionTokens: number };
-
 abstract class BaseLLMProvider implements LLMProvider {
   abstract readonly name: string;
+  readonly mode: 'live' | 'mock' = 'live';
 
   // Each vendor only implements this: call the API, return text + token counts
   protected abstract call(model: string, request: LLMRequest): Promise<RawResult>;
 
   // Template method: same steps for every vendor
-  async complete(model: string, request: LLMRequest): Promise<LLMResponse> {
+  async complete(model: string, request: LLMRequest, pricing: ModelPricing): Promise<LLMResponse> {
     const start = Date.now();
     const raw = await this.call(model, request);
     return {
@@ -51,13 +49,10 @@ abstract class BaseLLMProvider implements LLMProvider {
       completionTokens: raw.completionTokens,
       totalTokens: raw.promptTokens + raw.completionTokens,
       latencyMs: Date.now() - start,
-      costUsd: this.estimateCost(model, raw.promptTokens, raw.completionTokens),
+      costUsd:
+        (raw.promptTokens / 1000) * pricing.inputPer1k +
+        (raw.completionTokens / 1000) * pricing.outputPer1k,
     };
-  }
-
-  private estimateCost(model: string, promptTokens: number, completionTokens: number): number {
-    const costs = MODEL_COSTS[model] ?? { input: 0.001, output: 0.002 };
-    return (promptTokens / 1000) * costs.input + (completionTokens / 1000) * costs.output;
   }
 }
 
@@ -75,17 +70,21 @@ export class OpenAIProvider extends BaseLLMProvider {
     }
     messages.push({ role: 'user', content: request.userMessage });
 
+    // GPT-5 family: max_completion_tokens replaces max_tokens, and only the
+    // default temperature is accepted
+    const isReasoningModel = model.startsWith('gpt-5') || model.startsWith('o');
     const response = await client.chat.completions.create({
       model,
       messages,
-      max_tokens: request.maxTokens ?? 1024,
-      temperature: request.temperature ?? 0.7,
-    });
+      ...(isReasoningModel
+        ? { max_completion_tokens: request.maxTokens ?? 1024 }
+        : { max_tokens: request.maxTokens ?? 1024, temperature: request.temperature ?? 0.7 }),
+    } as OpenAI.ChatCompletionCreateParamsNonStreaming);
 
     return {
       responseText: response.choices[0]?.message?.content ?? '',
-      promptTokens: response.usage!.prompt_tokens,
-      completionTokens: response.usage!.completion_tokens,
+      promptTokens: response.usage?.prompt_tokens ?? 0,
+      completionTokens: response.usage?.completion_tokens ?? 0,
     };
   }
 }
@@ -117,24 +116,20 @@ export class GeminiProvider extends BaseLLMProvider {
   readonly name = 'gemini';
 
   protected async call(model: string, request: LLMRequest): Promise<RawResult> {
-    const apiKey = process.env.GEMINI_API_KEY;
-    const contents = [];
-    if (request.systemPrompt) {
-      contents.push({ role: 'user', parts: [{ text: request.systemPrompt }] });
-      contents.push({ role: 'model', parts: [{ text: 'Understood.' }] });
-    }
-    contents.push({ role: 'user', parts: [{ text: request.userMessage }] });
-
     const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
       {
-        contents,
+        ...(request.systemPrompt && {
+          systemInstruction: { parts: [{ text: request.systemPrompt }] },
+        }),
+        contents: [{ role: 'user', parts: [{ text: request.userMessage }] }],
         generationConfig: {
           maxOutputTokens: request.maxTokens ?? 1024,
           temperature: request.temperature ?? 0.7,
         },
       },
-      { timeout: 30000 }
+      // Key in a header rather than the query string, so it never lands in URL logs
+      { timeout: 30000, headers: { 'x-goog-api-key': process.env.GEMINI_API_KEY ?? '' } }
     );
 
     const candidate = response.data.candidates?.[0];
@@ -142,22 +137,24 @@ export class GeminiProvider extends BaseLLMProvider {
     return {
       responseText: candidate?.content?.parts?.map((p: any) => p.text).join('') ?? '',
       promptTokens: usage.promptTokenCount ?? 0,
-      completionTokens: usage.candidatesTokenCount ?? 0,
+      completionTokens: (usage.candidatesTokenCount ?? 0) + (usage.thoughtsTokenCount ?? 0),
     };
   }
 }
 
 // ─────────────────────────────────────────────
 // Mock vendor: lets the full pipeline (queue, failover, ledger, dashboard)
-// run without real vendor keys. Enabled with LLM_MOCK_MODE=true.
+// run without real vendor keys.
 // ─────────────────────────────────────────────
 export class MockProvider extends BaseLLMProvider {
+  readonly mode = 'mock' as const;
+
   constructor(readonly name: string) {
     super();
   }
 
   protected async call(model: string, request: LLMRequest): Promise<RawResult> {
-    await new Promise((r) => setTimeout(r, 200 + Math.random() * 600));
+    await new Promise((r) => setTimeout(r, 300 + Math.random() * 700));
     const failureRate = Number(process.env.LLM_MOCK_FAILURE_RATE ?? 0);
     if (Math.random() < failureRate) {
       throw Object.assign(new Error(`[mock] simulated ${this.name} outage`), { status: 503 });
@@ -167,20 +164,43 @@ export class MockProvider extends BaseLLMProvider {
     return {
       responseText,
       promptTokens: Math.ceil(((request.systemPrompt?.length ?? 0) + request.userMessage.length) / 4),
-      completionTokens: Math.ceil(responseText.length / 4),
+      completionTokens: Math.min(request.maxTokens ?? 1024, 40 + Math.floor(Math.random() * 160)),
     };
   }
 }
 
 // ─────────────────────────────────────────────
 // Registry: look up a provider by name (no if/else or switch needed)
+//
+// LLM_MOCK_MODE:
+//   auto  (default) → live if that vendor's API key is configured, else mock
+//   true            → every vendor is mocked
+//   false           → every vendor is live (missing keys fail and fail over)
 // ─────────────────────────────────────────────
 const registry = new Map<string, LLMProvider>(
   [new OpenAIProvider(), new AnthropicProvider(), new GeminiProvider()].map((p) => [p.name, p])
 );
+const mocks = new Map<string, LLMProvider>();
+
+const API_KEY_ENV: Record<string, string> = {
+  openai: 'OPENAI_API_KEY',
+  anthropic: 'ANTHROPIC_API_KEY',
+  gemini: 'GEMINI_API_KEY',
+};
+
+function hasRealKey(name: string): boolean {
+  const value = process.env[API_KEY_ENV[name] ?? ''];
+  return !!value && !/your-|-here|changeme/i.test(value);
+}
 
 export function getProvider(name: string): LLMProvider {
-  if (process.env.LLM_MOCK_MODE === 'true') return new MockProvider(name);
+  const mode = (process.env.LLM_MOCK_MODE ?? 'auto').toLowerCase();
+  const useMock = mode === 'true' || (mode === 'auto' && !hasRealKey(name));
+
+  if (useMock) {
+    if (!mocks.has(name)) mocks.set(name, new MockProvider(name));
+    return mocks.get(name)!;
+  }
   const provider = registry.get(name);
   if (!provider) throw new Error(`Unknown provider: ${name}`);
   return provider;

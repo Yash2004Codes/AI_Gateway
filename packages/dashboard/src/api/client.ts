@@ -16,7 +16,9 @@ api.interceptors.request.use((config) => {
 api.interceptors.response.use(
   (res) => res,
   (err) => {
-    if (err.response?.status === 401) {
+    // Only a rejected dashboard session logs out; a bad tenant key in the
+    // Playground (gateway routes) is just an error to show
+    if (err.response?.status === 401 && err.config?.url?.startsWith('/admin')) {
       localStorage.removeItem('gateway_token');
       window.location.href = '/login';
     }

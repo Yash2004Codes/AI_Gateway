@@ -1,25 +1,28 @@
 // ═══════════════════════════════════════════════════════
 // BullMQ Queue Configuration
-// Implements fair-share queuing with Tenant Group Keys
+// Jobs reach BullMQ through per-tenant fair-share lanes (see fairQueue.ts)
 // to prevent the "noisy neighbor" problem
 // ═══════════════════════════════════════════════════════
 
-import { Queue, Worker, QueueEvents, Job } from 'bullmq';
+import { Queue, QueueEvents } from 'bullmq';
 import { createRedisConnection } from '../db/redis';
 import { logger } from '../utils/logger';
+import { enqueueToLane, getLaneDepths, isFairShareEnabled } from './fairQueue';
 
 export const QUEUE_NAME = 'ai-gateway-requests';
 
 export interface GatewayJobData {
   requestId: string;
   tenantId: string;
-  tenantGroupKey: string;  // BullMQ group key for fair-share queuing
   requestedModel?: string;
   systemPrompt?: string;
   userMessage: string;
   maxTokens?: number;
   temperature?: number;
   callbackUrl?: string;
+  // Sliding-window reservation, reconciled against actual usage after completion
+  rateLimitAdmittedAt?: number;
+  rateLimitReservedTokens?: number;
 }
 
 export interface GatewayJobResult {
@@ -37,7 +40,6 @@ export interface GatewayJobResult {
 
 // ─────────────────────────────────────────────
 // Queue Factory
-// Using group keys for fair-share scheduling
 // ─────────────────────────────────────────────
 let gatewayQueue: Queue | null = null;
 
@@ -62,36 +64,33 @@ export function getGatewayQueue(): Queue {
 }
 
 // ─────────────────────────────────────────────
-// Add a job to the queue with tenant-based group key
-// This is the FAIR-SHARE implementation:
-// BullMQ processes jobs round-robin per group key (tenant),
-// preventing any single tenant from saturating the queue.
+// Enqueue a request.
+// Fair-share ON  → tenant lane; the scheduler feeds BullMQ round-robin.
+// Fair-share OFF → straight into BullMQ (global FIFO), kept for comparison.
 // ─────────────────────────────────────────────
 export async function enqueueRequest(
   data: GatewayJobData,
   priority: number = 5
-): Promise<Job<GatewayJobData, GatewayJobResult>> {
-  const queue = getGatewayQueue();
+): Promise<{ id: string; mode: 'fair-share' | 'fifo' }> {
+  const clamped = Math.max(1, Math.min(10, priority));
 
-  const job = await queue.add(
-    `${data.tenantId}:request`,
-    data,
-    {
-      priority: Math.max(1, Math.min(10, priority)),
-      // Group key enforces fair-share: one job per tenant processed in round-robin
-      // This prevents the noisy neighbor problem at the queue level
-      jobId: data.requestId,
-    }
-  );
+  if (await isFairShareEnabled()) {
+    const laneDepth = await enqueueToLane(data.tenantId, clamped, { ...data });
+    logger.info('Job enqueued to tenant lane', {
+      requestId: data.requestId,
+      tenantId: data.tenantId,
+      priority: clamped,
+      laneDepth,
+    });
+    return { id: data.requestId, mode: 'fair-share' };
+  }
 
-  logger.info('Job enqueued', {
-    jobId: job.id,
-    tenantId: data.tenantId,
-    requestId: data.requestId,
-    priority,
+  await getGatewayQueue().add(`${data.tenantId}:request`, data, {
+    priority: clamped,
+    jobId: data.requestId,
   });
-
-  return job;
+  logger.info('Job enqueued (FIFO mode)', { requestId: data.requestId, tenantId: data.tenantId });
+  return { id: data.requestId, mode: 'fifo' };
 }
 
 // ─────────────────────────────────────────────
@@ -104,16 +103,19 @@ export function createQueueEvents(): QueueEvents {
 
 // ─────────────────────────────────────────────
 // Queue metrics for dashboard
+// `lanes` = jobs still waiting in fair-share lanes (not yet handed to BullMQ)
 // ─────────────────────────────────────────────
 export async function getQueueMetrics() {
   const queue = getGatewayQueue();
-  const [waiting, active, completed, failed, delayed] = await Promise.all([
+  const [waiting, active, completed, failed, delayed, laneDepths] = await Promise.all([
     queue.getWaitingCount(),
     queue.getActiveCount(),
     queue.getCompletedCount(),
     queue.getFailedCount(),
     queue.getDelayedCount(),
+    getLaneDepths(),
   ]);
+  const lanes = Object.values(laneDepths).reduce((a, b) => a + b, 0);
 
-  return { waiting, active, completed, failed, delayed };
+  return { lanes, waiting, active, completed, failed, delayed };
 }

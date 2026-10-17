@@ -11,8 +11,16 @@ import { dispatchToProvider } from '../providers/dispatcher';
 import { logger } from '../utils/logger';
 import { batchLogger } from '../db/batchLogger';
 import { QUEUE_NAME, GatewayJobData, GatewayJobResult } from './gateway.queue';
-import { isAllowedProviderUrl } from '../providers/dispatcher';
-import axios from 'axios';
+import { reconcileTokens } from '../utils/slidingWindowLimiter';
+
+async function releaseReservation(data: GatewayJobData, actualTokens: number): Promise<void> {
+  if (data.rateLimitAdmittedAt === undefined || data.rateLimitReservedTokens === undefined) return;
+  try {
+    await reconcileTokens(data.tenantId, data.rateLimitAdmittedAt, data.rateLimitReservedTokens, actualTokens);
+  } catch (err) {
+    logger.warn('Token reservation reconcile failed', { error: (err as Error).message });
+  }
+}
 
 // ─────────────────────────────────────────────
 // Update request status in PostgreSQL
@@ -146,6 +154,9 @@ async function processGatewayJob(
       completed_at: new Date().toISOString(),
     });
 
+    // Nothing was consumed: release the whole reservation back to the window
+    await releaseReservation(job.data, 0);
+
     await publishJobUpdate({
       requestId,
       tenantId,
@@ -160,7 +171,6 @@ async function processGatewayJob(
   await job.updateProgress(80);
 
   // Write results to DB
-  const totalLatency = result.latencyMs;
   await updateRequestStatus(requestId, 'completed', {
     provider_used: result.provider,
     model_used: result.model,
@@ -171,11 +181,20 @@ async function processGatewayJob(
     estimated_cost_usd: result.costUsd,
     providers_tried: JSON.stringify(result.providersTried),
     completed_at: new Date().toISOString(),
-    total_latency_ms: totalLatency,
   });
+  // End-to-end latency as the client experiences it: queue wait + provider time
+  await query(
+    `UPDATE gateway_requests
+     SET total_latency_ms = (EXTRACT(EPOCH FROM (completed_at - queued_at)) * 1000)::int
+     WHERE id = $1`,
+    [requestId]
+  );
 
   // Write to token ledger
   await writeTokenLedger(requestId, tenantId, result);
+
+  // Swap the up-front estimate for the real token count in the sliding window
+  await releaseReservation(job.data, result.totalTokens);
 
   await job.updateProgress(95);
 
@@ -189,6 +208,7 @@ async function processGatewayJob(
     totalTokens: result.totalTokens,
     latencyMs: result.latencyMs,
     costUsd: result.costUsd,
+    providersTried: result.providersTried,
     timestamp: new Date().toISOString(),
   });
 

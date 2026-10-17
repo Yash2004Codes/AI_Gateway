@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS models (
     input_cost_per_1k_tokens NUMERIC(10, 6) NOT NULL DEFAULT 0,
     output_cost_per_1k_tokens NUMERIC(10, 6) NOT NULL DEFAULT 0,
     is_active BOOLEAN NOT NULL DEFAULT true,
+    is_default BOOLEAN NOT NULL DEFAULT false,  -- model used for this provider when none is requested
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE(provider_id, name)
 );
@@ -230,18 +231,19 @@ INSERT INTO providers (name, display_name, base_url, priority) VALUES
 ON CONFLICT (name) DO NOTHING;
 
 -- Seed: Models
+-- One default per provider is used for failover; prices are per 1K tokens and
+-- drive cost accounting. Verify against vendor pricing pages before billing.
 WITH openai_id AS (SELECT id FROM providers WHERE name = 'openai'),
      anthropic_id AS (SELECT id FROM providers WHERE name = 'anthropic'),
      gemini_id AS (SELECT id FROM providers WHERE name = 'gemini')
-INSERT INTO models (provider_id, name, display_name, context_window, input_cost_per_1k_tokens, output_cost_per_1k_tokens)
+INSERT INTO models (provider_id, name, display_name, context_window, input_cost_per_1k_tokens, output_cost_per_1k_tokens, is_default)
 VALUES
-    ((SELECT id FROM openai_id), 'gpt-4o', 'GPT-4o', 128000, 0.005, 0.015),
-    ((SELECT id FROM openai_id), 'gpt-4o-mini', 'GPT-4o Mini', 128000, 0.00015, 0.0006),
-    ((SELECT id FROM openai_id), 'gpt-3.5-turbo', 'GPT-3.5 Turbo', 16385, 0.0005, 0.0015),
-    ((SELECT id FROM anthropic_id), 'claude-3-5-sonnet-20241022', 'Claude 3.5 Sonnet', 200000, 0.003, 0.015),
-    ((SELECT id FROM anthropic_id), 'claude-3-haiku-20240307', 'Claude 3 Haiku', 200000, 0.00025, 0.00125),
-    ((SELECT id FROM gemini_id), 'gemini-1.5-pro', 'Gemini 1.5 Pro', 2000000, 0.00125, 0.005),
-    ((SELECT id FROM gemini_id), 'gemini-1.5-flash', 'Gemini 1.5 Flash', 1000000, 0.000075, 0.0003)
+    ((SELECT id FROM openai_id), 'gpt-5-mini', 'GPT-5 Mini', 400000, 0.00025, 0.002, true),
+    ((SELECT id FROM openai_id), 'gpt-5-nano', 'GPT-5 Nano', 400000, 0.00005, 0.0004, false),
+    ((SELECT id FROM anthropic_id), 'claude-haiku-5-5', 'Claude Haiku 5.5', 200000, 0.001, 0.005, true),
+    ((SELECT id FROM anthropic_id), 'claude-sonnet-5-5', 'Claude Sonnet 5.5', 200000, 0.003, 0.015, false),
+    ((SELECT id FROM gemini_id), 'gemini-2.5-flash', 'Gemini 2.5 Flash', 1000000, 0.0003, 0.0025, true),
+    ((SELECT id FROM gemini_id), 'gemini-2.5-flash-lite', 'Gemini 2.5 Flash-Lite', 1000000, 0.0001, 0.0004, false)
 ON CONFLICT (provider_id, name) DO NOTHING;
 
 -- Seed: Demo tenant (raw key: demo-api-key-change-in-production)
@@ -253,6 +255,15 @@ VALUES (
     50000,
     500
 )
+ON CONFLICT (name) DO NOTHING;
+
+-- Seed: Demo traffic tenants (used by the dashboard's Demo Control page).
+-- Initech is deliberately the "noisy neighbour" with a tight RPM limit.
+INSERT INTO tenants (name, api_key_hash, api_key_prefix, tpm_limit, rpm_limit)
+VALUES
+    ('Acme Corp', encode(sha256(convert_to('demo-key-acme', 'UTF8')), 'hex'), 'demo-key-ac', 60000, 600),
+    ('Globex', encode(sha256(convert_to('demo-key-globex', 'UTF8')), 'hex'), 'demo-key-gl', 60000, 600),
+    ('Initech (noisy)', encode(sha256(convert_to('demo-key-initech', 'UTF8')), 'hex'), 'demo-key-in', 25000, 200)
 ON CONFLICT (name) DO NOTHING;
 
 -- Seed: Admin user (password: admin123 - CHANGE IN PRODUCTION)

@@ -11,6 +11,7 @@ import { getQueueMetrics } from '../queue/gateway.queue';
 import { query } from '../db/pool';
 import { logger } from '../utils/logger';
 import { verifyJwt } from '../middleware/auth.middleware';
+import { getLiveSnapshot } from '../services/liveMetrics';
 import Redis from 'ioredis';
 
 let io: SocketIOServer | null = null;
@@ -96,26 +97,16 @@ export function initializeSocketIO(httpServer: HttpServer): SocketIOServer {
     }
   });
 
-  // ── Periodic metrics push (every 5s) ──────────────
+  // ── Periodic control-plane push (every 2s) ────────
+  // queue + lanes, provider health, breakers, chaos, per-tenant windows
   const metricsInterval = setInterval(async () => {
     if (!io || io.engine.clientsCount === 0) return;
     try {
-      const [queueMetrics, providerHealth] = await Promise.all([
-        getQueueMetrics(),
-        query(`
-          SELECT name, health_status, error_rate, avg_latency_ms
-          FROM providers WHERE is_active = true ORDER BY priority
-        `),
-      ]);
-      io.emit('metrics:update', {
-        queue: queueMetrics,
-        providers: providerHealth,
-        timestamp: new Date().toISOString(),
-      });
+      io.emit('metrics:update', await getLiveSnapshot());
     } catch (err) {
       logger.error('Failed to push metrics', { error: (err as Error).message });
     }
-  }, 5000);
+  }, 2000);
 
   httpServer.on('close', () => {
     clearInterval(metricsInterval);

@@ -23,8 +23,8 @@ router.post(
   '/completions',
   apiKeyAuth,
   idempotencyMiddleware,
+  validateGatewayRequest, // before the limiter, so malformed requests don't spend quota
   tenantRateLimiter,
-  validateGatewayRequest,
   async (req: AuthenticatedRequest, res: Response): Promise<void> => {
     const tenant = req.tenant!;
     const {
@@ -43,15 +43,17 @@ router.post(
     // ── Create request record in PostgreSQL ────────────
     const requestId = uuidv4();
 
+    // job_id = requestId (deterministic), so it is known before enqueueing
     await query(
       `INSERT INTO gateway_requests
-         (id, tenant_id, idempotency_key, status, requested_model,
+         (id, tenant_id, idempotency_key, job_id, status, requested_model,
           system_prompt, user_message, max_tokens, priority, queued_at)
-       VALUES ($1, $2, $3, 'queued', $4, $5, $6, $7, $8, NOW())`,
+       VALUES ($1, $2, $3, $4, 'queued', $5, $6, $7, $8, $9, NOW())`,
       [
         requestId,
         tenant.id,
         idempotencyKey ?? null,
+        requestId,
         requestedModel ?? null,
         systemPrompt ?? null,
         userMessage,
@@ -60,26 +62,21 @@ router.post(
       ]
     );
 
-    // ── Enqueue to BullMQ with tenant group key ────────
+    // ── Enqueue: tenant fair-share lane (or FIFO when disabled) ──
     const job = await enqueueRequest(
       {
         requestId,
         tenantId: tenant.id,
-        tenantGroupKey: tenant.id,  // Fair-share: round-robin per tenant
         requestedModel,
         systemPrompt,
         userMessage,
         maxTokens,
         temperature,
         callbackUrl,
+        rateLimitAdmittedAt: res.locals.rateLimit?.admittedAt,
+        rateLimitReservedTokens: res.locals.rateLimit?.reservedTokens,
       },
       priority
-    );
-
-    // Update record with job ID
-    await query(
-      'UPDATE gateway_requests SET job_id = $1 WHERE id = $2',
-      [job.id, requestId]
     );
 
     logger.info('Request accepted and queued', {
@@ -87,6 +84,7 @@ router.post(
       jobId: job.id,
       tenantId: tenant.id,
       priority,
+      mode: job.mode,
     });
 
     // ── Return 202 Accepted immediately ───────────────
@@ -157,8 +155,8 @@ router.get(
   apiKeyAuth,
   async (req: AuthenticatedRequest, res: Response): Promise<void> => {
     const tenant = req.tenant!;
-    const page = parseInt(req.query.page as string ?? '1', 10);
-    const limit = Math.min(parseInt(req.query.limit as string ?? '20', 10), 100);
+    const page = Math.max(1, parseInt(req.query.page as string, 10) || 1);
+    const limit = Math.min(Math.max(1, parseInt(req.query.limit as string, 10) || 20), 100);
     const offset = (page - 1) * limit;
     const status = req.query.status as string | undefined;
 

@@ -1,4 +1,4 @@
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { queryOne, query } from '../db/pool';
@@ -7,6 +7,18 @@ import { getQueueMetrics } from '../queue/gateway.queue';
 import { getCachedMetrics, cacheMetrics } from '../db/redis';
 import { generateApiKey } from '../utils/apiKey';
 import { circuitBreaker } from '../utils/redisCircuitBreaker';
+import { setChaos } from '../utils/chaos';
+import { setFairShareEnabled } from '../queue/fairQueue';
+import { getLiveSnapshot } from '../services/liveMetrics';
+import { getProvider } from '../providers/llmProviders';
+import { seedHistory } from '../demo/seedHistory';
+import {
+  getTrafficStatus,
+  startSteady,
+  startBurst,
+  stopTraffic,
+  resetCounters,
+} from '../demo/trafficGenerator';
 
 const router = Router();
 
@@ -122,7 +134,7 @@ router.get(
   jwtAuth,
   requireRole('admin', 'operator'),
   async (req: AuthenticatedRequest, res: Response): Promise<void> => {
-    const hours = parseInt(req.query.hours as string ?? '24', 10);
+    const hours = Math.min(Math.max(1, parseInt(req.query.hours as string, 10) || 24), 720);
 
     const series = await query(`
       SELECT
@@ -150,7 +162,7 @@ router.get(
   jwtAuth,
   requireRole('admin', 'operator'),
   async (req: AuthenticatedRequest, res: Response): Promise<void> => {
-    const limit = Math.min(parseInt(req.query.limit as string ?? '50', 10), 200);
+    const limit = Math.min(Math.max(1, parseInt(req.query.limit as string, 10) || 50), 200);
     const status = req.query.status as string | undefined;
 
     const statusFilter = status ? 'WHERE gr.status = $2' : '';
@@ -247,7 +259,10 @@ router.get(
       FROM models m ORDER BY m.provider_id, m.name
     `);
 
-    res.json({ providers, models });
+    res.json({
+      providers: providers.map((p: { name: string }) => ({ ...p, mode: getProvider(p.name).mode })),
+      models,
+    });
   }
 );
 
@@ -276,6 +291,127 @@ router.post(
     const { provider } = req.params;
     await circuitBreaker.reset(provider);
     res.json({ success: true, message: `Circuit breaker for ${provider} reset to CLOSED` });
+  }
+);
+
+// ─────────────────────────────────────────────
+// PATCH /api/v1/admin/providers/:id/status
+// Enable/disable a provider; the dispatcher reads this on every job
+// ─────────────────────────────────────────────
+router.patch(
+  '/providers/:id/status',
+  jwtAuth,
+  requireRole('admin'),
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    if (typeof req.body?.isActive !== 'boolean') {
+      res.status(400).json({ error: 'isActive (boolean) is required' });
+      return;
+    }
+    const provider = await queryOne(
+      'UPDATE providers SET is_active = $1 WHERE id = $2 RETURNING id, name, is_active',
+      [req.body.isActive, req.params.id]
+    );
+    if (!provider) {
+      res.status(404).json({ error: 'Provider not found' });
+      return;
+    }
+    res.json(provider);
+  }
+);
+
+// ─────────────────────────────────────────────
+// Live control plane: GET /live, chaos, fair-share mode
+// ─────────────────────────────────────────────
+router.get(
+  '/live',
+  jwtAuth,
+  requireRole('admin', 'operator'),
+  async (_req: AuthenticatedRequest, res: Response): Promise<void> => {
+    res.json(await getLiveSnapshot());
+  }
+);
+
+router.put(
+  '/chaos/:provider',
+  jwtAuth,
+  requireRole('admin'),
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    const exists = await queryOne('SELECT 1 FROM providers WHERE name = $1', [req.params.provider]);
+    if (!exists) {
+      res.status(404).json({ error: 'Provider not found' });
+      return;
+    }
+    const chaos = await setChaos(req.params.provider, req.body ?? {});
+    res.json({ provider: req.params.provider, ...chaos });
+  }
+);
+
+router.put(
+  '/fair-share',
+  jwtAuth,
+  requireRole('admin'),
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    if (typeof req.body?.enabled !== 'boolean') {
+      res.status(400).json({ error: 'enabled (boolean) is required' });
+      return;
+    }
+    await setFairShareEnabled(req.body.enabled);
+    res.json({ fairShare: req.body.enabled });
+  }
+);
+
+// ─────────────────────────────────────────────
+// Demo controls (only when DEMO_MODE=true)
+// ─────────────────────────────────────────────
+const demoOnly = (_req: Request, res: Response, next: NextFunction): void => {
+  if (process.env.DEMO_MODE !== 'true') {
+    res.status(404).json({ error: 'Demo mode is disabled' });
+    return;
+  }
+  next();
+};
+
+router.get('/demo/traffic', jwtAuth, requireRole('admin', 'operator'), demoOnly, (_req, res) => {
+  res.json(getTrafficStatus());
+});
+
+router.post(
+  '/demo/traffic',
+  jwtAuth,
+  requireRole('admin'),
+  demoOnly,
+  async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    const { action } = req.body ?? {};
+    switch (action) {
+      case 'steady':
+        startSteady();
+        break;
+      case 'burst':
+        startSteady(); // the point of the burst is its effect on the others
+        startBurst(); // runs in the background
+        break;
+      case 'stop':
+        stopTraffic();
+        break;
+      case 'reset':
+        resetCounters();
+        break;
+      default:
+        res.status(400).json({ error: "action must be 'steady', 'burst', 'stop' or 'reset'" });
+        return;
+    }
+    res.json(getTrafficStatus());
+  }
+);
+
+router.post(
+  '/demo/seed-history',
+  jwtAuth,
+  requireRole('admin'),
+  demoOnly,
+  async (_req: AuthenticatedRequest, res: Response): Promise<void> => {
+    const result = await seedHistory();
+    res.json(result);
   }
 );
 

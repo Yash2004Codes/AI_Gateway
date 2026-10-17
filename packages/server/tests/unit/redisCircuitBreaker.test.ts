@@ -1,58 +1,21 @@
 import { RedisCircuitBreaker } from '../../src/utils/redisCircuitBreaker';
 
-// Mock Redis client in memory for circuit breaker testing
-class MemoryRedis {
-  private data = new Map<string, Map<string, string>>();
+import { createTestRedis } from './redisTestClient';
 
-  async hgetall(key: string): Promise<Record<string, string>> {
-    const map = this.data.get(key);
-    if (!map) return {};
-    return Object.fromEntries(map.entries());
-  }
-
-  async hset(key: string, fieldOrObj: any, val?: any): Promise<number> {
-    if (!this.data.has(key)) this.data.set(key, new Map());
-    const map = this.data.get(key)!;
-
-    if (typeof fieldOrObj === 'object') {
-      for (const [k, v] of Object.entries(fieldOrObj)) {
-        map.set(k, String(v));
-      }
-    } else {
-      map.set(fieldOrObj, String(val));
-    }
-    return 1;
-  }
-
-  async hincrby(key: string, field: string, increment: number): Promise<number> {
-    if (!this.data.has(key)) this.data.set(key, new Map());
-    const map = this.data.get(key)!;
-    const current = parseInt(map.get(field) ?? '0', 10);
-    const updated = current + increment;
-    map.set(field, updated.toString());
-    return updated;
-  }
-
-  multi() {
-    const self = this;
-    const ops: Array<() => Promise<any>> = [];
-    return {
-      hset(key: string, fieldOrObj: any) {
-        ops.push(() => self.hset(key, fieldOrObj));
-        return this;
-      },
-      async exec() {
-        for (const op of ops) await op();
-      },
-    };
-  }
-}
-
-const mockRedis = new MemoryRedis();
+// Runs against a real Redis so the Lua transition scripts are exercised
+const mockRedis = createTestRedis();
 
 jest.mock('../../src/db/redis', () => ({
   getRedis: () => mockRedis,
 }));
+
+beforeEach(async () => {
+  await mockRedis.flushdb();
+});
+
+afterAll(async () => {
+  await mockRedis.quit();
+});
 
 describe('Redis Circuit Breaker State Machine', () => {
   let cb: RedisCircuitBreaker;
@@ -147,5 +110,16 @@ describe('Redis Circuit Breaker State Machine', () => {
 
     // Fast-fails again
     expect(await cb.canExecute('mistral')).toBe(false);
+  });
+
+  it('admits at most halfOpenMaxTrials concurrent probes in HALF_OPEN', async () => {
+    await cb.recordFailure('openai');
+    await cb.recordFailure('openai');
+    await cb.recordFailure('openai');
+    await new Promise((r) => setTimeout(r, 1100));
+
+    // 10 workers race for probe slots at the same instant
+    const results = await Promise.all(Array.from({ length: 10 }, () => cb.canExecute('openai')));
+    expect(results.filter(Boolean)).toHaveLength(2);
   });
 });

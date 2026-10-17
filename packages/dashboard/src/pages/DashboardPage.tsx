@@ -4,7 +4,7 @@ import {
   CartesianGrid, Tooltip, ResponsiveContainer, Legend,
 } from 'recharts';
 import { format, parseISO } from 'date-fns';
-import { useSocket } from '../contexts/SocketContext';
+import { useSocket, ProviderControl } from '../contexts/SocketContext';
 import api from '../api/client';
 
 interface OverviewData {
@@ -14,7 +14,7 @@ interface OverviewData {
     avg_latency_ms: string; success_rate: string;
   };
   tokens: { total_tokens: string; total_cost_usd: string; active_tenants: string; };
-  queue: { waiting: number; active: number; completed: number; failed: number; delayed: number; };
+  queue: { lanes: number; waiting: number; active: number; completed: number; failed: number; delayed: number; };
   providers: Array<{ name: string; display_name: string; health_status: string; error_rate: number; avg_latency_ms: number; }>;
 }
 
@@ -53,7 +53,7 @@ const CustomTooltip = ({ active, payload, label }: any) => {
 };
 
 export default function DashboardPage() {
-  const { providers, queueMetrics, liveEvents } = useSocket();
+  const { providers, queueMetrics, liveEvents, controls } = useSocket();
   const [overview, setOverview] = useState<OverviewData | null>(null);
   const [series, setSeries] = useState<TimeSeriesPoint[]>([]);
   const [loading, setLoading] = useState(true);
@@ -155,8 +155,8 @@ export default function DashboardPage() {
         />
         <StatCard
           label="Queue Depth"
-          value={(queueMetrics.waiting + queueMetrics.active).toString()}
-          sub={`${queueMetrics.active} active workers`}
+          value={(queueMetrics.lanes + queueMetrics.waiting + queueMetrics.active).toString()}
+          sub={`${queueMetrics.lanes} in tenant lanes · ${queueMetrics.active} active`}
           gradient="linear-gradient(135deg,#a855f7,#ec4899)"
           iconBg="rgba(168,85,247,0.15)"
           icon={<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#a855f7" strokeWidth="2"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>}
@@ -170,7 +170,9 @@ export default function DashboardPage() {
           Provider Health
         </h3>
         <div className="provider-grid">
-          {providers.map((p) => <ProviderCard key={p.name} provider={p} />)}
+          {providers.map((p) => (
+            <ProviderCard key={p.name} provider={p} control={controls.find((c) => c.name === p.name)} />
+          ))}
           {providers.length === 0 && (
             <div className="empty-state" style={{ gridColumn: '1/-1' }}>
               <div className="empty-state-title">No providers configured</div>
@@ -224,6 +226,7 @@ export default function DashboardPage() {
             <div className="card-body">
               <div className="queue-bar-wrapper">
                 {[
+                  { key: 'lanes',     label: 'Tenant lanes (fair-share)', color: '#ec4899', bg: 'linear-gradient(90deg,#ec4899,#a855f7)' },
                   { key: 'waiting',   label: 'Waiting',   color: '#6366f1', bg: 'linear-gradient(90deg,#6366f1,#8b5cf6)' },
                   { key: 'active',    label: 'Active',    color: '#10b981', bg: 'linear-gradient(90deg,#10b981,#14b8a6)' },
                   { key: 'completed', label: 'Completed', color: '#06b6d4', bg: 'linear-gradient(90deg,#06b6d4,#3b82f6)' },
@@ -294,7 +297,9 @@ function StatCard({ label, value, sub, gradient, iconBg, icon }: {
   );
 }
 
-function ProviderCard({ provider }: { provider: any }) {
+const BREAKER_BADGE: Record<string, string> = { CLOSED: 'badge-success', HALF_OPEN: 'badge-warning', OPEN: 'badge-danger' };
+
+function ProviderCard({ provider, control }: { provider: any; control?: ProviderControl }) {
   const statusColor = { healthy: 'var(--color-success)', degraded: 'var(--color-warning)', down: 'var(--color-danger)' };
   const badgeClass = { healthy: 'badge-success', degraded: 'badge-warning', down: 'badge-danger' };
 
@@ -318,6 +323,20 @@ function ProviderCard({ provider }: { provider: any }) {
           <span className="provider-metric-value">{provider.avg_latency_ms}ms</span>
         </div>
       </div>
+      {control && (
+        <div style={{ display: 'flex', gap: '0.4rem', marginTop: '0.75rem', flexWrap: 'wrap' }}>
+          <span className={`badge ${BREAKER_BADGE[control.breaker.state]}`} title="Circuit breaker state">
+            breaker {control.breaker.state.replace('_', '-').toLowerCase()}
+          </span>
+          <span className={`badge ${control.mode === 'live' ? 'badge-info' : 'badge-neutral'}`} title={control.mode === 'live' ? 'Real vendor API' : 'Simulated vendor (no API key configured)'}>
+            {control.mode}
+          </span>
+          {control.chaos.failureRate > 0 && (
+            <span className="badge badge-danger">chaos {Math.round(control.chaos.failureRate * 100)}%</span>
+          )}
+          {provider.is_active === false && <span className="badge badge-neutral">disabled</span>}
+        </div>
+      )}
     </div>
   );
 }
@@ -328,7 +347,9 @@ function ActivityItem({ event }: { event: any }) {
     failed: 'var(--color-danger)',
     processing: 'var(--color-info)',
     queued: 'var(--color-warning)',
+    rate_limited: 'var(--color-danger)',
   };
+  const failedOver = (event.providersTried?.length ?? 0) > 1;
   const color = colors[event.status] ?? 'var(--color-text-muted)';
 
   return (
@@ -336,11 +357,20 @@ function ActivityItem({ event }: { event: any }) {
       <div className="activity-dot" style={{ background: color, boxShadow: `0 0 8px ${color}` }} />
       <div className="activity-content">
         <div className="activity-title">
-          {event.status === 'completed' ? `${event.provider} / ${event.model}` : event.status.charAt(0).toUpperCase() + event.status.slice(1)}
+          {event.status === 'completed'
+            ? `${event.provider} / ${event.model}`
+            : event.status === 'rate_limited'
+              ? `429 · ${event.tenantName ?? 'tenant'} (${event.error === 'RPM_EXCEEDED' ? 'RPM' : 'TPM'})`
+              : event.status.charAt(0).toUpperCase() + event.status.slice(1)}
+          {failedOver && (
+            <span className="badge badge-warning" style={{ marginLeft: '0.5rem', fontSize: '0.62rem' }}>
+              failover: {event.providersTried.map((p: string) => p.split('/')[0]).join(' → ')}
+            </span>
+          )}
           {event.totalTokens ? <span style={{ color: 'var(--color-text-muted)', fontWeight: 400, marginLeft: '0.5rem', fontSize: '0.75rem' }}>{event.totalTokens.toLocaleString()} tokens</span> : null}
         </div>
         <div className="activity-meta">
-          <span className="font-mono">{event.requestId.slice(0, 8)}…</span>
+          {event.requestId && <span className="font-mono">{event.requestId.slice(0, 8)}…</span>}
           {event.latencyMs && <span>{event.latencyMs}ms</span>}
           {event.costUsd && <span>${Number(event.costUsd).toFixed(5)}</span>}
         </div>
