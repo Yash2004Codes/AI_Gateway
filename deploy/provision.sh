@@ -20,7 +20,8 @@ fi
 MY_IP=$(curl -fsS https://checkip.amazonaws.com)
 VPC_ID=$(aws ec2 describe-vpcs --region "$REGION" --filters Name=isDefault,Values=true \
   --query 'Vpcs[0].VpcId' --output text)
-AMI_ID=$(aws ssm get-parameter --region "$REGION" \
+# MSYS_NO_PATHCONV: stop Git Bash on Windows rewriting /aws/... into a file path
+AMI_ID=$(MSYS_NO_PATHCONV=1 aws ssm get-parameter --region "$REGION" \
   --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
   --query 'Parameter.Value' --output text)
 
@@ -28,7 +29,7 @@ echo "==> Key pair"
 mkdir -p "$HOME/.ssh"
 aws ec2 create-key-pair --region "$REGION" --key-name "$NAME" --key-type ed25519 \
   --tag-specifications "ResourceType=key-pair,Tags=[{$TAGS}]" \
-  --query 'KeyMaterial' --output text > "$KEY_FILE"
+  --query 'KeyMaterial' --output text | tr -d '\r' > "$KEY_FILE"  # AWS CLI on Windows emits CRLF
 chmod 600 "$KEY_FILE"
 
 echo "==> Security group"
@@ -54,7 +55,7 @@ aws ec2 wait instance-running --region "$REGION" --instance-ids "$INSTANCE_ID"
 echo "==> Elastic IP"
 read -r ALLOC_ID PUBLIC_IP < <(aws ec2 allocate-address --region "$REGION" --domain vpc \
   --tag-specifications "ResourceType=elastic-ip,Tags=[{$TAGS}]" \
-  --query '[AllocationId,PublicIp]' --output text)
+  --query '[AllocationId,PublicIp]' --output text | tr -d '\r')
 aws ec2 associate-address --region "$REGION" --instance-id "$INSTANCE_ID" --allocation-id "$ALLOC_ID" >/dev/null
 
 cat > "$STATE" <<EOF

@@ -45,7 +45,7 @@ $SSH "cd ~/ai-gateway && $COMPOSE up -d --build --remove-orphans"
 
 echo "==> Waiting for https://$DOMAIN (certificate + API health)"
 for i in $(seq 1 60); do
-  curl -fsS "https://$DOMAIN/api/v1/admin/live" -o /dev/null -w '%{http_code}' 2>/dev/null | grep -q 401 && break
+  curl -sS "https://$DOMAIN/api/v1/admin/live" -o /dev/null -w '%{http_code}' 2>/dev/null | grep -q 401 && break
   [ "$i" = 60 ] && { echo "Timed out. Check: $SSH 'cd ~/ai-gateway && $COMPOSE logs --tail 50'"; exit 1; }
   sleep 5
 done
