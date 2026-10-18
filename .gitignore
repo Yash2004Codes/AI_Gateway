@@ -24,3 +24,8 @@ Thumbs.db
 
 # Test / coverage
 coverage/
+
+# Deployment state and secrets
+deploy/.state
+deploy/.release.tar.gz
+*.pem

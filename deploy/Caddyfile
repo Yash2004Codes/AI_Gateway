@@ -1,0 +1,14 @@
+# Public entry point. Caddy obtains and renews the HTTPS certificate for $DOMAIN
+# automatically. The dashboard's nginx serves the SPA and forwards /api and
+# /socket.io to the API server on the internal network.
+{$DOMAIN} {
+	encode gzip
+	reverse_proxy dashboard:80
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+}
